@@ -1,4 +1,4 @@
-/* TimeBlock Organizer v1.1.6 | MIT | generated from src/ */
+/* TimeBlock Organizer v1.1.7 | MIT | generated from src/ */
 
 // src/core.js
 function createLegacyRuntime({ extensionAPI }) {
@@ -492,9 +492,18 @@ function createLegacyRuntime({ extensionAPI }) {
     return parseTimePrefix(s) !== null;
   }
   const LOOSE_TIME_RE = /\b(\d{1,2}):(\d{2})\b/;
+  const LEADING_NOISE_RE = /^(?:\s|\{\{\[\[(?:TODO|DONE)\]\]\}\}|\[\[[^\]]*\]\]|\(\([^)]*\)\)|\*\*|__|#[\w/-]+|[-–—•]\s)+/;
+  function stripLeadingNoise(s) {
+    let out = s, prev = null;
+    for (let i = 0; i < 12 && out !== prev; i++) {
+      prev = out;
+      out = out.replace(LEADING_NOISE_RE, "");
+    }
+    return out;
+  }
   function looseParseTimePrefix(s) {
     if (!s || !state.settings.looseSortFallback) return null;
-    const head = s.slice(0, 30);
+    const head = stripLeadingNoise(s).slice(0, 30);
     const m = head.match(LOOSE_TIME_RE);
     if (!m) return null;
     const h = parseInt(m[1], 10);
@@ -516,6 +525,7 @@ function createLegacyRuntime({ extensionAPI }) {
   }
   function formatMinAsHHMM(minutes) {
     if (!Number.isFinite(minutes) || minutes < 0) return "00:00";
+    if (minutes === 1440) return "24:00";
     const h = Math.floor(minutes / 60) % 24;
     const m = minutes % 60;
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
@@ -721,12 +731,23 @@ function createLegacyRuntime({ extensionAPI }) {
     const tbUntimed = nonButtonChildren.filter(
       (c) => !isTimePrefixed(c.string) && looseParseTimePrefix(c.string) === null
     );
+    let seq = 0;
+    const keyed = (c, start2, end) => ({ c, start: start2, end, seq: seq++ });
     const allTimed = [
-      ...tbStrictTimed.map((c) => ({ c, sort: parseTimePrefix(c.string).startMin })),
-      ...tbLooseTimed.map((c) => ({ c, sort: looseParseTimePrefix(c.string) })),
-      ...pageLevelMisplaced.map((c) => ({ c, sort: parseTimePrefix(c.string).startMin }))
+      ...tbStrictTimed.map((c) => {
+        const t = parseTimePrefix(c.string);
+        return keyed(c, t.startMin, t.endMin);
+      }),
+      ...tbLooseTimed.map((c) => {
+        const s = looseParseTimePrefix(c.string);
+        return keyed(c, s, s);
+      }),
+      ...pageLevelMisplaced.map((c) => {
+        const t = parseTimePrefix(c.string);
+        return keyed(c, t.startMin, t.endMin);
+      })
     ];
-    allTimed.sort((a, b) => a.sort - b.sort);
+    allTimed.sort((a, b) => a.start - b.start || a.end - b.end || a.seq - b.seq);
     const allTodos = allTimed.map((x) => x.c);
     const desired = state.settings.untimedAtBottom ? [...allTodos, ...tbUntimed, ...tbButtons] : [...tbUntimed, ...allTodos, ...tbButtons];
     return {
@@ -804,9 +825,12 @@ function createLegacyRuntime({ extensionAPI }) {
         if (resolvedUpdates.length > 0) {
           const refreshedChildren = getDirectChildren(tbUid);
           const refreshedTodos = refreshedChildren.filter((c) => isTimePrefixed(c.string));
-          const refreshedSorted = [...refreshedTodos].sort(
-            (a, b) => parseTimePrefix(a.string).startMin - parseTimePrefix(b.string).startMin
-          );
+          const refreshedKeyed = refreshedTodos.map((c, i) => {
+            const t = parseTimePrefix(c.string);
+            return { c, start: t.startMin, end: t.endMin, seq: i };
+          });
+          refreshedKeyed.sort((a, b) => a.start - b.start || a.end - b.end || a.seq - b.seq);
+          const refreshedSorted = refreshedKeyed.map((x) => x.c);
           let needsResort = false;
           for (let i = 0; i < refreshedTodos.length; i++) {
             if (refreshedTodos[i].uid !== refreshedSorted[i].uid) {
@@ -1230,7 +1254,37 @@ function createLegacyRuntime({ extensionAPI }) {
     applySettings,
     setSetting,
     getSettings: () => ({ ...state.settings }),
-    helpers: { parseTimePrefix, looseParseTimePrefix, detectOverlaps, resolveConflicts, formatMinAsHHMM }
+    helpers: {
+      parseTimePrefix,
+      looseParseTimePrefix,
+      detectOverlaps,
+      resolveConflicts,
+      formatMinAsHHMM,
+      stripLeadingNoise,
+      /* v1.1.7 — pure ordering kernel, extracted so the sort contract is
+       * testable without a live graph. computeDesiredOrder does the same
+       * bucketing against real block records; this takes plain strings. */
+      sortTimedEntries(items) {
+        let seq = 0;
+        const keyed = [], untimed = [];
+        for (const it of items) {
+          const s = typeof it === "string" ? it : it.string;
+          const strict = parseTimePrefix(s);
+          if (strict) {
+            keyed.push({ it, start: strict.startMin, end: strict.endMin, seq: seq++ });
+            continue;
+          }
+          const loose = looseParseTimePrefix(s);
+          if (loose !== null) {
+            keyed.push({ it, start: loose, end: loose, seq: seq++ });
+            continue;
+          }
+          untimed.push(it);
+        }
+        keyed.sort((a, b) => a.start - b.start || a.end - b.end || a.seq - b.seq);
+        return { timed: keyed.map((x) => x.it), untimed };
+      }
+    }
   };
 }
 
