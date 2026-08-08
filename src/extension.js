@@ -1,6 +1,6 @@
 import { createLegacyRuntime } from "./core.js";
 
-export const VERSION = "1.1.6";
+export const VERSION = "1.1.8";
 export const SETTINGS_KEY = "settings";
 let activeRuntime = null;
 
@@ -79,4 +79,3 @@ export function onunload() {
 }
 
 export default { onload, onunload };
-

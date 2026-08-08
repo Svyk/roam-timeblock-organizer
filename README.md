@@ -1,6 +1,8 @@
 # TimeBlock Organizer
 
-Depot-ready v1.1.6 of the personal TimeBlock Organizer. It watches current and recently visited daily pages, moves time-prefixed blocks under `#TimeBlock`, keeps the timestamp SmartBlock pinned, and preserves the established conflict detection and opt-in bump-forward resolution behavior.
+Depot-ready v1.1.8 of the personal TimeBlock Organizer. It recognizes standalone `#TimeBlock` tags in headings such as `Schedule #TimeBlock`, continuously organizes direct children with bounded shallow watches, keeps unfinished Elapsed Time sessions in a stable Now lane above the timestamp launcher, and moves completed sessions into chronological order.
+
+The live path is intentionally light: today, tomorrow, and at most one open historical Daily Note are watched; description-only typing is ignored; relevant TimeBlock changes use a 1.5-second trailing debounce; and an order change uses one `block.reorderBlocks` write when Roam supports it. A five-minute sweep remains only as recovery.
 
 ## Install for development
 
@@ -18,4 +20,3 @@ On first load, settings from localStorage and `[[TimeBlock Organizer Settings]]`
 - `npm run check` runs the complete release gate.
 
 Source is MIT licensed.
-

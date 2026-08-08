@@ -73,6 +73,54 @@ test("strict and loose entries interleave chronologically, not by bucket", () =>
     "a loose 10:00 must land between strict 09:00 and 11:00, not after both");
 });
 
+test("Schedule #TimeBlock matches as a standalone tag anywhere", () => {
+  const re = helpers().buildTimeBlockSignatureRegex("#TimeBlock");
+  for (const value of ["#TimeBlock", "Schedule #TimeBlock", "Schedule #TimeBlock notes"]) {
+    assert.equal(re.test(value), true, `${value} should match`);
+  }
+  for (const value of ["#TimeBlocked", "Schedule #TimeBlocking", "foo#TimeBlock"]) {
+    assert.equal(re.test(value), false, `${value} should not match`);
+  }
+});
+
+test("unfinished Elapsed Time sessions stay in the Now lane until closed", () => {
+  const h = helpers();
+  const active = "07:56 {{⇥🕞:SmartBlock:Elapsed time}} working";
+  assert.deepEqual(h.parseTimePrefix(active), { startMin: 476, endMin: 476 });
+  assert.equal(h.activeSessionStart(active), 476);
+
+  const open = h.sortTimedEntries([
+    "08:00 - 09:00 planned",
+    active,
+    "07:00 - 07:30 completed",
+  ]);
+  assert.deepEqual(open.timed, ["07:00 - 07:30 completed", "08:00 - 09:00 planned"]);
+  assert.deepEqual(open.active, [active], "open session belongs in the separate Now lane");
+
+  const closed = "07:56 - 08:30 (**34'**) working";
+  const finished = h.sortTimedEntries(["08:00 - 09:00 planned", closed]);
+  assert.deepEqual(finished.active, []);
+  assert.deepEqual(finished.timed, [closed, "08:00 - 09:00 planned"]);
+});
+
+test("unfinished Elapsed Time sessions are excluded from conflict resolution", () => {
+  const h = helpers();
+  const active = { uid: "active", string: "09:30 {{⇥🕞:SmartBlock:Elapsed time}} working" };
+  const result = h.resolveConflicts([
+    { uid: "plan", string: "09:00 - 10:00 planned" },
+    active,
+  ], 23 * 60);
+  assert.deepEqual(result, { updates: [], deadEnds: [] });
+});
+
+test("minimal fallback moves only displaced children", () => {
+  const plan = helpers().buildMinimalMovePlan(
+    ["planned", "button", "finished"],
+    ["finished", "planned", "button"],
+  );
+  assert.deepEqual(plan, [{ uid: "finished", order: 0 }]);
+});
+
 test("ordering is total and stable for identical keys", () => {
   const h = helpers();
   const { timed } = h.sortTimedEntries([

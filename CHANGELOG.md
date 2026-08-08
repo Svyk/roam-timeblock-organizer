@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.1.8] - 2026-08-08
+
+Continuous organization without broad graph work.
+
+- **Recognize the live TimeBlock heading.** The configured tag is now matched as a
+  standalone token anywhere in the parent string, so `Schedule #TimeBlock` works
+  while `#TimeBlocked` remains excluded. This repairs all pages using the current
+  Daily Note template rather than only parents that begin with `#TimeBlock`.
+- **Organize active work sessions safely.** An unfinished line such as
+  `07:56 {{⇥🕞:SmartBlock:Elapsed time}}` stays in a stable Now lane directly
+  above the permanent timestamp launcher. It is excluded from conflict resolution
+  and is never auto-closed. When Elapsed replaces the marker with an end time and
+  duration, the completed range joins chronological order.
+- **Watch the right level.** Each watched Daily Note owns two shallow pull watches:
+  the page's direct children and the matched TimeBlock's direct children. This catches
+  SmartBlock creation/completion immediately without recursive pulls, per-task watches,
+  or relying on the five-minute recovery sweep. Description-only edits are filtered.
+- **Bound live work.** Normal operation watches only today, tomorrow, and at most one
+  currently open historical Daily Note. Reconciles are trailing-debounced,
+  single-flight, and use page-specific self-write suppression.
+- **Reduce write amplification.** In-parent order drift now uses Roam's documented
+  `data.block.reorderBlocks` API for one write. Older clients fall back to numeric
+  moves for only the displaced children; the previous implementation moved every
+  child sequentially whenever one item was out of place.
+- **Follow the current navigation API.** Page navigation and current-page commands now
+  await `ui.mainWindow.getOpenPageOrBlockUid()` as documented.
+- Added regression tests for heading boundaries, active-to-completed session behavior,
+  watch ownership/cleanup, description-event filtering, async navigation, minimal
+  fallback moves, and the one-write reorder contract.
+
 ## [1.1.7] - 2026-08-06
 
 Ordering correctness. Three defects, each reproduced by a regression test that fails
@@ -30,4 +60,3 @@ O(n log n) regex executions for O(n) work.
 
 - Ported the existing v1.1.6 organizer/conflict engine to a Depot lifecycle without changing reconciliation semantics.
 - Added extension settings migration, idempotent cleanup, deterministic builds, tests, and GitHub Pages deployment.
-

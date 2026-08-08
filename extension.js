@@ -1,20 +1,23 @@
-/* TimeBlock Organizer v1.1.7 | MIT | generated from src/ */
+/* TimeBlock Organizer v1.1.8 | MIT | generated from src/ */
 
 // src/core.js
 function createLegacyRuntime({ extensionAPI }) {
   const commandPaletteApi = extensionAPI?.ui?.commandPalette ?? window.roamAlphaAPI?.ui?.commandPalette;
-  const VERSION2 = "1.1.6";
+  const VERSION2 = "1.1.8";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
   const DEFAULTS = {
     enabled: true,
     debounceMs: 8e3,
     // coalesce burst writes
+    timeblockDebounceMs: 1500,
+    // fast trailing debounce for relevant TimeBlock changes
     historicalWindowDays: 7,
     // how far back to auto-watch on navigation
     maxActiveWatches: 14,
-    // LRU cap
+    // hard safety cap; normal operation watches <=3 pages
     timeblockSignature: "#TimeBlock",
+    activeSessionSignature: "{{\u21E5\u{1F55E}:SmartBlock:Elapsed time}}",
     smartblockButtonSignature: "{{\u{1F557}\u21A6:SmartBlock:Double timestamp buttons2}}",
     sweepIntervalMs: 5 * 6e4,
     // periodic reconcile in case watches miss edits
@@ -51,15 +54,21 @@ function createLegacyRuntime({ extensionAPI }) {
   };
   const state = {
     settings: { ...DEFAULTS },
+    disposed: false,
     activeWatches: /* @__PURE__ */ new Map(),
-    // pageUid → { unsub, lastUsed }
+    // pageUid → owned page + TimeBlock watches
     pendingReconciles: /* @__PURE__ */ new Map(),
     // pageUid → debounce timer
-    suppressUntil: 0,
-    // ms timestamp; ignore watches before this
+    inFlightReconciles: /* @__PURE__ */ new Map(),
+    // pageUid → active reconcile promise
+    dirtyReconciles: /* @__PURE__ */ new Map(),
+    // pageUid → latest reason received in flight
+    suppressUntilByPage: /* @__PURE__ */ new Map(),
+    // pageUid → ignore own watch callbacks until timestamp
     sweepTimer: null,
     rolloverTimer: null,
     cachedTodayUid: null,
+    navigationPageUid: null,
     navigationListenerAttached: false,
     registeredCommandLabels: /* @__PURE__ */ new Set()
   };
@@ -84,6 +93,13 @@ function createLegacyRuntime({ extensionAPI }) {
       "ms to wait after a daily-page change before reconciling. Coalesces burst writes from COS / Better Tasks."
     ],
     [
+      "timeblock_debounce_ms",
+      "timeblockDebounceMs",
+      "int",
+      1500,
+      "Trailing debounce for organizer-relevant changes inside TimeBlock. Description-only typing is ignored before this timer is scheduled."
+    ],
+    [
       "historical_window_days",
       "historicalWindowDays",
       "int",
@@ -95,14 +111,21 @@ function createLegacyRuntime({ extensionAPI }) {
       "maxActiveWatches",
       "int",
       14,
-      "Cap on simultaneously-watched daily pages. LRU evicts when exceeded."
+      "Hard cap on simultaneously-watched daily pages. Normal operation watches today, tomorrow, and at most one open historical page (three total)."
     ],
     [
       "timeblock_signature",
       "timeblockSignature",
       "string",
       DEFAULTS.timeblockSignature,
-      "TAG that identifies the TimeBlock parent block on a daily page. Default `#TimeBlock`. v1.1.5+: matched as `^<tag>(\\s|$)` \u2014 block must START with the tag followed by whitespace or end-of-string. Permits both legacy form (`#TimeBlock {{[[roam/render]]:((roam-render-Nautilus-cljs))...}}`) and post-2026-05-07 plain `#TimeBlock`. Edit if you renamed the tag (e.g. `#tb`)."
+      "Standalone TAG that identifies the TimeBlock parent anywhere in its text. Default `#TimeBlock`; matches `#TimeBlock` and `Schedule #TimeBlock`, but not `#TimeBlocked`. Edit if you renamed the tag (e.g. `#tb`)."
+    ],
+    [
+      "active_session_signature",
+      "activeSessionSignature",
+      "string",
+      DEFAULTS.activeSessionSignature,
+      "Exact marker used by an unfinished Elapsed Time SmartBlock session. Active sessions stay in the Now lane immediately above the permanent timestamp launcher until closed."
     ],
     [
       "smartblock_button_signature",
@@ -116,7 +139,7 @@ function createLegacyRuntime({ extensionAPI }) {
       "sweepIntervalMs",
       "int",
       3e5,
-      "Periodic reconcile sweep over all watched pages. Catches edits that pull-watch on :block/children misses (e.g. text-only changes that add a time prefix)."
+      "Low-frequency recovery sweep over the bounded watched pages. Direct TimeBlock watches are the primary path; this only recovers from missed callbacks or temporary API failures."
     ],
     [
       "rollover_check_ms",
@@ -445,11 +468,18 @@ function createLegacyRuntime({ extensionAPI }) {
       return [];
     }
   }
+  function buildTimeBlockSignatureRegex(signature = state.settings.timeblockSignature) {
+    if (!signature) return null;
+    const escSig = signature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp("(?:^|\\s)" + escSig + "(?=\\s|$)");
+  }
+  function isTimeBlockParent(blockString) {
+    const re = buildTimeBlockSignatureRegex();
+    return Boolean(re && re.test(blockString || ""));
+  }
   function findTimeBlockUid(dailyPageUid) {
-    const sig = state.settings.timeblockSignature;
-    if (!sig) return null;
-    const escSig = sig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp("^" + escSig + "(?:\\s|$)");
+    const re = buildTimeBlockSignatureRegex();
+    if (!re) return null;
     const children = getDirectChildren(dailyPageUid);
     for (const c of children) {
       if (re.test(c.string)) return c.uid;
@@ -459,6 +489,7 @@ function createLegacyRuntime({ extensionAPI }) {
   const TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
   const TODO_TIME_PREFIX_RE = /^(\{\{\[\[(?:TODO|DONE)\]\]\}\}\s+)(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
   const SINGLE_TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s+(?=\S)/;
+  const ACTIVE_TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})(?:\s*[-–])?\s+(?=\S)/;
   function parseTimePrefix(blockString) {
     if (!blockString) return null;
     let m = blockString.match(TIME_PREFIX_RE);
@@ -519,6 +550,19 @@ function createLegacyRuntime({ extensionAPI }) {
   function isSmartBlockButton(s) {
     return s === state.settings.smartblockButtonSignature;
   }
+  function activeSessionStart(s) {
+    const marker = state.settings.activeSessionSignature;
+    if (!s || !marker || !s.includes(marker)) return null;
+    const m = s.match(ACTIVE_TIME_PREFIX_RE);
+    if (!m) return null;
+    const h = parseInt(m[1], 10);
+    const mn = parseInt(m[2], 10);
+    if (h > 23 || mn > 59) return null;
+    return h * 60 + mn;
+  }
+  function isActiveSession(s) {
+    return activeSessionStart(s) !== null;
+  }
   function isPinned(s) {
     const marker = state.settings.pinnedMarker;
     return marker && s.includes(marker);
@@ -549,25 +593,22 @@ function createLegacyRuntime({ extensionAPI }) {
     }
     return blockString;
   }
+  function conflictIgnoreTags() {
+    const ignoreList = String(state.settings.conflictIgnoreMarkers || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (state.settings.concurrentMarker) ignoreList.push(state.settings.concurrentMarker);
+    return Array.from(new Set(ignoreList));
+  }
   function detectOverlaps(sortedItems) {
     const conflicts = [];
-    const concurrentMarker = state.settings.concurrentMarker;
-    const ignoreList = String(state.settings.conflictIgnoreMarkers || "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (concurrentMarker) ignoreList.push(concurrentMarker);
-    const ignoreSet = Array.from(new Set(ignoreList));
-    const containsIgnoreTag = (str) => {
-      for (const tag of ignoreSet) {
-        if (str.includes(tag)) return true;
-      }
-      return false;
-    };
+    const ignoreSet = conflictIgnoreTags();
+    const hasIgnoreTag = (str) => ignoreSet.some((tag) => str.includes(tag));
     const parsed = sortedItems.map((it) => ({ ...it, t: parseTimePrefix(it.string) })).filter((it) => it.t && it.t.endMin > it.t.startMin);
     for (let i = 0; i < parsed.length; i++) {
       const a = parsed[i];
       for (let j = i + 1; j < parsed.length; j++) {
         const b = parsed[j];
         if (b.t.startMin >= a.t.endMin) break;
-        if (ignoreSet.length && (containsIgnoreTag(a.string) || containsIgnoreTag(b.string))) {
+        if (ignoreSet.length && (hasIgnoreTag(a.string) || hasIgnoreTag(b.string))) {
           continue;
         }
         const overlapStart = Math.max(a.t.startMin, b.t.startMin);
@@ -596,7 +637,7 @@ function createLegacyRuntime({ extensionAPI }) {
       currentString: it.string,
       t: parseTimePrefix(it.string),
       pinned: isPinned(it.string)
-    })).filter((it) => it.t);
+    })).filter((it) => it.t && !isActiveSession(it.originalString));
     const updates = [];
     const deadEnds = [];
     for (let i = 1; i < working.length; i++) {
@@ -720,36 +761,40 @@ function createLegacyRuntime({ extensionAPI }) {
     const pageChildren = getDirectChildren(pageUid);
     const tbChildren = getDirectChildren(tbUid);
     const pageLevelMisplaced = pageChildren.filter(
-      (c) => c.uid !== tbUid && isTimePrefixed(c.string)
+      (c) => c.uid !== tbUid && (isTimePrefixed(c.string) || isActiveSession(c.string))
     );
     const tbButtons = tbChildren.filter((c) => isSmartBlockButton(c.string));
     const nonButtonChildren = tbChildren.filter((c) => !isSmartBlockButton(c.string));
-    const tbStrictTimed = nonButtonChildren.filter((c) => isTimePrefixed(c.string));
-    const tbLooseTimed = nonButtonChildren.filter(
-      (c) => !isTimePrefixed(c.string) && looseParseTimePrefix(c.string) !== null
-    );
-    const tbUntimed = nonButtonChildren.filter(
-      (c) => !isTimePrefixed(c.string) && looseParseTimePrefix(c.string) === null
-    );
     let seq = 0;
     const keyed = (c, start2, end) => ({ c, start: start2, end, seq: seq++ });
-    const allTimed = [
-      ...tbStrictTimed.map((c) => {
-        const t = parseTimePrefix(c.string);
-        return keyed(c, t.startMin, t.endMin);
-      }),
-      ...tbLooseTimed.map((c) => {
-        const s = looseParseTimePrefix(c.string);
-        return keyed(c, s, s);
-      }),
-      ...pageLevelMisplaced.map((c) => {
-        const t = parseTimePrefix(c.string);
-        return keyed(c, t.startMin, t.endMin);
-      })
-    ];
+    const allTimed = [];
+    const activeSessions = [];
+    const tbUntimed = [];
+    const classify = (c, mayBeUntimed) => {
+      const activeStart = activeSessionStart(c.string);
+      if (activeStart !== null) {
+        activeSessions.push(keyed(c, activeStart, activeStart));
+        return;
+      }
+      const strict = parseTimePrefix(c.string);
+      if (strict) {
+        allTimed.push(keyed(c, strict.startMin, strict.endMin));
+        return;
+      }
+      const loose = looseParseTimePrefix(c.string);
+      if (loose !== null) {
+        allTimed.push(keyed(c, loose, loose));
+        return;
+      }
+      if (mayBeUntimed) tbUntimed.push(c);
+    };
+    for (const c of nonButtonChildren) classify(c, true);
+    for (const c of pageLevelMisplaced) classify(c, false);
     allTimed.sort((a, b) => a.start - b.start || a.end - b.end || a.seq - b.seq);
+    activeSessions.sort((a, b) => a.start - b.start || a.seq - b.seq);
     const allTodos = allTimed.map((x) => x.c);
-    const desired = state.settings.untimedAtBottom ? [...allTodos, ...tbUntimed, ...tbButtons] : [...tbUntimed, ...allTodos, ...tbButtons];
+    const activeTodos = activeSessions.map((x) => x.c);
+    const desired = state.settings.untimedAtBottom ? [...allTodos, ...tbUntimed, ...activeTodos, ...tbButtons] : [...tbUntimed, ...allTodos, ...activeTodos, ...tbButtons];
     return {
       desired,
       pageLevelMisplaced,
@@ -764,8 +809,94 @@ function createLegacyRuntime({ extensionAPI }) {
     }
     return true;
   }
+  function setPageSuppression(pageUid) {
+    state.suppressUntilByPage.set(pageUid, Date.now() + state.settings.suppressMs);
+  }
+  function isPageSuppressed(pageUid) {
+    const until = state.suppressUntilByPage.get(pageUid) || 0;
+    if (Date.now() < until) return true;
+    if (until) state.suppressUntilByPage.delete(pageUid);
+    return false;
+  }
+  function buildMinimalMovePlan(currentUids, desiredUids) {
+    const working = [...currentUids];
+    const moves = [];
+    for (let order = 0; order < desiredUids.length; order++) {
+      const uid = desiredUids[order];
+      if (working[order] === uid) continue;
+      const from = working.indexOf(uid);
+      if (from < 0) continue;
+      working.splice(from, 1);
+      working.splice(order, 0, uid);
+      moves.push({ uid, order });
+    }
+    return moves;
+  }
+  function focusedActiveSessionWouldMove(desired, currentTbChildren, pageLevelMisplaced) {
+    let focusedUid = null;
+    try {
+      focusedUid = window.roamAlphaAPI.ui.getFocusedBlock()?.["block-uid"] || null;
+    } catch {
+    }
+    if (!focusedUid) return false;
+    const focused = desired.find((item) => item.uid === focusedUid);
+    if (!focused || !isActiveSession(focused.string)) return false;
+    if (pageLevelMisplaced.some((item) => item.uid === focusedUid)) return true;
+    return currentTbChildren.findIndex((item) => item.uid === focusedUid) !== desired.findIndex((item) => item.uid === focusedUid);
+  }
+  async function applyDesiredOrder(pageUid, tbUid, desired, pageLevelMisplaced, currentTbChildren) {
+    const api = window.roamAlphaAPI.data.block;
+    const desiredUids = desired.map((item) => item.uid);
+    const workingUids = currentTbChildren.map((item) => item.uid);
+    let writes = 0;
+    for (const item of pageLevelMisplaced) {
+      try {
+        setPageSuppression(pageUid);
+        await api.move({
+          location: { "parent-uid": tbUid, order: "last" },
+          block: { uid: item.uid }
+        });
+        workingUids.push(item.uid);
+        writes++;
+      } catch (e) {
+        log("warn", `move into TimeBlock failed for ${item.uid}`, e?.message || e);
+        return { writes, failed: 1 };
+      }
+    }
+    if (workingUids.length === desiredUids.length && workingUids.every((uid, index) => uid === desiredUids[index])) {
+      return { writes, failed: 0 };
+    }
+    if (typeof api.reorderBlocks === "function") {
+      try {
+        setPageSuppression(pageUid);
+        await api.reorderBlocks({
+          location: { "parent-uid": tbUid },
+          blocks: desiredUids
+        });
+        return { writes: writes + 1, failed: 0 };
+      } catch (e) {
+        log("warn", `atomic reorder failed on ${tbUid}; using minimal-move fallback`, e?.message || e);
+      }
+    }
+    let failed = 0;
+    const movePlan = buildMinimalMovePlan(workingUids, desiredUids);
+    for (const move of movePlan) {
+      try {
+        setPageSuppression(pageUid);
+        await api.move({
+          location: { "parent-uid": tbUid, order: move.order },
+          block: { uid: move.uid }
+        });
+        writes++;
+      } catch (e) {
+        failed++;
+        log("warn", `fallback reorder failed for ${move.uid}`, e?.message || e);
+      }
+    }
+    return { writes, failed };
+  }
   async function reconcileTimeBlock(pageUid, reason = "watch") {
-    if (!state.settings.enabled) return;
+    if (state.disposed || !state.settings.enabled) return;
     const tbUid = findTimeBlockUid(pageUid);
     if (!tbUid) {
       debug(`no TimeBlock parent on page ${pageUid} \u2014 skip`);
@@ -774,32 +905,23 @@ function createLegacyRuntime({ extensionAPI }) {
     const { desired, pageLevelMisplaced, currentTbChildren } = computeDesiredOrder(pageUid, tbUid);
     const alreadyOrganized = isAlreadyOrganized(desired, currentTbChildren, pageLevelMisplaced);
     if (!alreadyOrganized) {
-      const moveCount = pageLevelMisplaced.length + desired.filter(
-        (d, i) => currentTbChildren[i]?.uid !== d.uid
-      ).length;
-      log("info", `reconciling TimeBlock on ${pageUid} (${reason}): ${pageLevelMisplaced.length} pulled in + reorder, ${moveCount} block.moves`);
+      log("info", `reconciling TimeBlock on ${pageUid} (${reason}): ${pageLevelMisplaced.length} pulled in + reorder`);
       if (state.settings.dryRun) {
         log("info", `[dry-run] would move into order:`, desired.map((d) => ({
           uid: d.uid,
           preview: d.string.slice(0, 50)
         })));
+      } else if (focusedActiveSessionWouldMove(desired, currentTbChildren, pageLevelMisplaced)) {
+        debug(`focused active session on ${pageUid} would move \u2014 defer until its next change or sweep`);
       } else {
-        state.suppressUntil = Date.now() + state.settings.suppressMs;
-        const api = window.roamAlphaAPI.data.block;
-        let executed = 0, failed = 0;
-        for (const item of desired) {
-          try {
-            await api.move({
-              location: { "parent-uid": tbUid, order: "last" },
-              block: { uid: item.uid }
-            });
-            executed++;
-          } catch (e) {
-            log("warn", `move failed for ${item.uid}`, e?.message || e);
-            failed++;
-          }
-        }
-        if (failed > 0) log("warn", `reconcile complete with ${failed} failures (${executed} ok)`);
+        const { writes, failed } = await applyDesiredOrder(
+          pageUid,
+          tbUid,
+          desired,
+          pageLevelMisplaced,
+          currentTbChildren
+        );
+        debug(`reconcile order complete: ${writes} write(s), ${failed} failure(s)`);
       }
     } else {
       debug(`page ${pageUid} already organized (${desired.length} children)`);
@@ -807,14 +929,14 @@ function createLegacyRuntime({ extensionAPI }) {
     let resolvedUpdates = [];
     if (state.settings.conflictDetection && state.settings.autoResolveConflicts && !state.settings.dryRun) {
       const finalChildren = getDirectChildren(tbUid);
-      const todos = finalChildren.filter((c) => isTimePrefixed(c.string));
+      const todos = finalChildren.filter((c) => isTimePrefixed(c.string) && !isActiveSession(c.string));
       const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
       const result = resolveConflicts(todos, cutoff);
       if (result.updates.length > 0) {
-        state.suppressUntil = Date.now() + state.settings.suppressMs;
         const api = window.roamAlphaAPI.data.block;
         for (const u of result.updates) {
           try {
+            setPageSuppression(pageUid);
             await api.update({ block: { uid: u.uid, string: u.newString } });
             resolvedUpdates.push(u);
             log("info", `bumped ((${u.uid})): ${formatMinAsHHMM(u.bumpedFrom.startMin)} \u2192 ${formatMinAsHHMM(u.bumpedTo.startMin)}`);
@@ -823,41 +945,26 @@ function createLegacyRuntime({ extensionAPI }) {
           }
         }
         if (resolvedUpdates.length > 0) {
-          const refreshedChildren = getDirectChildren(tbUid);
-          const refreshedTodos = refreshedChildren.filter((c) => isTimePrefixed(c.string));
-          const refreshedKeyed = refreshedTodos.map((c, i) => {
-            const t = parseTimePrefix(c.string);
-            return { c, start: t.startMin, end: t.endMin, seq: i };
-          });
-          refreshedKeyed.sort((a, b) => a.start - b.start || a.end - b.end || a.seq - b.seq);
-          const refreshedSorted = refreshedKeyed.map((x) => x.c);
-          let needsResort = false;
-          for (let i = 0; i < refreshedTodos.length; i++) {
-            if (refreshedTodos[i].uid !== refreshedSorted[i].uid) {
-              needsResort = true;
-              break;
-            }
-          }
-          if (needsResort) {
-            const buttons = refreshedChildren.filter((c) => isSmartBlockButton(c.string));
-            const others = refreshedChildren.filter(
-              (c) => !isTimePrefixed(c.string) && !isSmartBlockButton(c.string)
+          const refreshed = computeDesiredOrder(pageUid, tbUid);
+          if (!isAlreadyOrganized(
+            refreshed.desired,
+            refreshed.currentTbChildren,
+            refreshed.pageLevelMisplaced
+          )) {
+            await applyDesiredOrder(
+              pageUid,
+              tbUid,
+              refreshed.desired,
+              refreshed.pageLevelMisplaced,
+              refreshed.currentTbChildren
             );
-            const finalDesired = [...others, ...refreshedSorted, ...buttons];
-            for (const item of finalDesired) {
-              try {
-                await api.move({ location: { "parent-uid": tbUid, order: "last" }, block: { uid: item.uid } });
-              } catch (e) {
-                log("warn", `post-bump re-sort move failed for ${item.uid}`, e?.message || e);
-              }
-            }
           }
         }
       }
     }
     if (state.settings.conflictDetection) {
       const finalChildren = getDirectChildren(tbUid);
-      const todos = finalChildren.filter((c) => isTimePrefixed(c.string));
+      const todos = finalChildren.filter((c) => isTimePrefixed(c.string) && !isActiveSession(c.string));
       const conflicts = detectOverlaps(todos);
       let deadEnds = [];
       if (state.settings.autoResolveConflicts) {
@@ -874,33 +981,137 @@ function createLegacyRuntime({ extensionAPI }) {
           log("warn", `  dead-end: ${timeRangeOf(de.item)} "${shortDescription(de.item.originalString)}" \u2014 ${de.reason}`);
         }
         if (!state.settings.dryRun) {
-          state.suppressUntil = Date.now() + state.settings.suppressMs;
+          setPageSuppression(pageUid);
           await ensureStatusBlock(pageUid, conflicts, deadEnds);
         }
       } else {
         if (!state.settings.dryRun) {
-          state.suppressUntil = Date.now() + state.settings.suppressMs;
+          setPageSuppression(pageUid);
           await deleteStatusBlock(pageUid);
         }
       }
     }
   }
-  function scheduleReconcile(pageUid, reason) {
+  async function runReconcile(pageUid, reason) {
+    if (state.inFlightReconciles.has(pageUid)) {
+      state.dirtyReconciles.set(pageUid, reason);
+      return state.inFlightReconciles.get(pageUid);
+    }
+    const task = (async () => {
+      let nextReason = reason;
+      do {
+        state.dirtyReconciles.delete(pageUid);
+        await reconcileTimeBlock(pageUid, nextReason);
+        nextReason = state.dirtyReconciles.get(pageUid);
+      } while (nextReason && state.settings.enabled);
+    })().finally(() => {
+      state.inFlightReconciles.delete(pageUid);
+      state.dirtyReconciles.delete(pageUid);
+    });
+    state.inFlightReconciles.set(pageUid, task);
+    return task;
+  }
+  function scheduleReconcile(pageUid, reason, delayMs = state.settings.debounceMs) {
     if (state.pendingReconciles.has(pageUid)) {
       clearTimeout(state.pendingReconciles.get(pageUid));
     }
     const t = setTimeout(() => {
       state.pendingReconciles.delete(pageUid);
-      reconcileTimeBlock(pageUid, reason).catch(
+      runReconcile(pageUid, reason).catch(
         (e) => log("warn", `reconcile threw on ${pageUid}`, e?.message || e)
       );
-    }, state.settings.debounceMs);
+    }, Math.max(0, delayMs));
     state.pendingReconciles.set(pageUid, t);
+  }
+  const WATCH_PULL = "[:block/uid {:block/children [:block/uid :block/string :block/order]}]";
+  function pullWatchEntity(uid) {
+    const escaped = String(uid).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    return `[:block/uid "${escaped}"]`;
+  }
+  function childrenFromWatchPull(pull) {
+    return (pull?.[":block/children"] || []).map((c) => ({
+      uid: c[":block/uid"] || "",
+      string: c[":block/string"] || "",
+      order: c[":block/order"] || 0
+    })).sort((a, b) => a.order - b.order);
+  }
+  function watchSortKey(item) {
+    const activeStart = activeSessionStart(item.string);
+    if (activeStart !== null) return `active:${activeStart}`;
+    if (isSmartBlockButton(item.string)) return "button";
+    const strict = parseTimePrefix(item.string);
+    if (strict) return `timed:${strict.startMin}:${strict.endMin}`;
+    const loose = looseParseTimePrefix(item.string);
+    if (loose !== null) return `loose:${loose}`;
+    return "untimed";
+  }
+  function pageWatchFingerprint(pull) {
+    const parentRe = buildTimeBlockSignatureRegex();
+    return childrenFromWatchPull(pull).map((item) => ({
+      item,
+      parent: Boolean(parentRe && parentRe.test(item.string)),
+      sortKey: watchSortKey(item)
+    })).filter(({ parent, sortKey }) => parent || sortKey !== "untimed").map(({ item, parent, sortKey }) => `${item.uid}:${parent ? "parent" : sortKey}`).join("|");
+  }
+  function timeBlockWatchFingerprint(pull) {
+    const ignoreTags = conflictIgnoreTags();
+    return childrenFromWatchPull(pull).map((item) => `${item.uid}:${item.order}:${watchSortKey(item)}:${isPinned(item.string) ? 1 : 0}:${ignoreTags.some((tag) => item.string.includes(tag)) ? 1 : 0}`).join("|");
+  }
+  function hasRelevantWatchChange(before, after, kind) {
+    if (!before || !after) return true;
+    const fingerprint = kind === "page" ? pageWatchFingerprint : timeBlockWatchFingerprint;
+    return fingerprint(before) !== fingerprint(after);
+  }
+  function addOwnedPullWatch(uid, callback, label) {
+    const entity = pullWatchEntity(uid);
+    const data = window.roamAlphaAPI.data;
+    try {
+      Promise.resolve(data.addPullWatch(WATCH_PULL, entity, callback)).catch(
+        (e) => log("warn", `addPullWatch failed for ${label} ${uid}`, e?.message || e)
+      );
+    } catch (e) {
+      log("warn", `addPullWatch failed for ${label} ${uid}`, e?.message || e);
+    }
+    return () => {
+      try {
+        Promise.resolve(data.removePullWatch(WATCH_PULL, entity, callback)).catch(
+          (e) => debug(`removePullWatch failed for ${label} ${uid}`, e?.message || e)
+        );
+      } catch (e) {
+        debug(`removePullWatch failed for ${label} ${uid}`, e?.message || e);
+      }
+    };
+  }
+  function refreshTimeBlockWatch(pageUid) {
+    const watch = state.activeWatches.get(pageUid);
+    if (!watch) return;
+    const nextUid = findTimeBlockUid(pageUid);
+    if (nextUid === watch.timeBlockUid) return;
+    try {
+      watch.timeBlockUnsub?.();
+    } catch {
+    }
+    watch.timeBlockUid = nextUid;
+    watch.timeBlockUnsub = null;
+    if (!nextUid) return;
+    const callback = (before, after) => {
+      if (isPageSuppressed(pageUid)) {
+        debug(`TimeBlock watch on ${pageUid} suppressed (self-triggered)`);
+        return;
+      }
+      if (!hasRelevantWatchChange(before, after, "timeblock")) return;
+      watch.lastUsed = Date.now();
+      scheduleReconcile(pageUid, "timeblock-watch", state.settings.timeblockDebounceMs);
+    };
+    watch.timeBlockCallback = callback;
+    watch.timeBlockUnsub = addOwnedPullWatch(nextUid, callback, "TimeBlock");
+    debug(`watching TimeBlock ${nextUid} for page ${pageUid}`);
   }
   function registerWatch(pageUid, reason) {
     if (state.activeWatches.has(pageUid)) {
       const w = state.activeWatches.get(pageUid);
       w.lastUsed = Date.now();
+      refreshTimeBlockWatch(pageUid);
       return;
     }
     if (state.activeWatches.size >= state.settings.maxActiveWatches) {
@@ -912,52 +1123,43 @@ function createLegacyRuntime({ extensionAPI }) {
         }
       }
       if (oldestUid) {
-        try {
-          state.activeWatches.get(oldestUid).unsub();
-        } catch {
-        }
-        state.activeWatches.delete(oldestUid);
+        unregisterWatch(oldestUid);
         debug(`LRU evicted watch on ${oldestUid}`);
       }
     }
-    const cb = () => {
-      if (Date.now() < state.suppressUntil) {
-        debug(`watch on ${pageUid} fired but suppressed (self-triggered)`);
+    const watch = {
+      pageUnsub: null,
+      timeBlockUnsub: null,
+      timeBlockUid: null,
+      lastUsed: Date.now(),
+      registeredAt: Date.now()
+    };
+    state.activeWatches.set(pageUid, watch);
+    const pageCallback = (before, after) => {
+      if (isPageSuppressed(pageUid)) {
+        debug(`page watch on ${pageUid} suppressed (self-triggered)`);
         return;
       }
-      scheduleReconcile(pageUid, "watch");
+      if (!hasRelevantWatchChange(before, after, "page")) return;
+      watch.lastUsed = Date.now();
+      refreshTimeBlockWatch(pageUid);
+      scheduleReconcile(pageUid, "page-watch", state.settings.debounceMs);
     };
-    try {
-      window.roamAlphaAPI.data.addPullWatch(
-        "[{:block/children [:block/uid :block/string :block/order]}]",
-        [":block/uid", pageUid],
-        cb
-      );
-      state.activeWatches.set(pageUid, {
-        unsub: () => {
-          try {
-            window.roamAlphaAPI.data.removePullWatch(
-              "[{:block/children [:block/uid :block/string :block/order]}]",
-              [":block/uid", pageUid],
-              cb
-            );
-          } catch {
-          }
-        },
-        lastUsed: Date.now(),
-        registeredAt: Date.now()
-      });
-      debug(`registered watch on ${pageUid} (${reason}) \u2014 ${state.activeWatches.size} active`);
-      scheduleReconcile(pageUid, `${reason}-initial`);
-    } catch (e) {
-      log("warn", `addPullWatch failed for ${pageUid}`, e?.message || e);
-    }
+    watch.pageCallback = pageCallback;
+    watch.pageUnsub = addOwnedPullWatch(pageUid, pageCallback, "page");
+    refreshTimeBlockWatch(pageUid);
+    debug(`registered watch on ${pageUid} (${reason}) \u2014 ${state.activeWatches.size} active`);
+    scheduleReconcile(pageUid, `${reason}-initial`, state.settings.timeblockDebounceMs);
   }
   function unregisterWatch(pageUid) {
     const w = state.activeWatches.get(pageUid);
     if (!w) return;
     try {
-      w.unsub();
+      w.pageUnsub?.();
+    } catch {
+    }
+    try {
+      w.timeBlockUnsub?.();
     } catch {
     }
     state.activeWatches.delete(pageUid);
@@ -965,49 +1167,64 @@ function createLegacyRuntime({ extensionAPI }) {
       clearTimeout(state.pendingReconciles.get(pageUid));
       state.pendingReconciles.delete(pageUid);
     }
+    state.suppressUntilByPage.delete(pageUid);
+    state.dirtyReconciles.delete(pageUid);
     debug(`unregistered watch on ${pageUid}`);
   }
   function checkRollover() {
     const newToday = todayPageUid();
     if (!newToday) return;
     if (newToday === state.cachedTodayUid) return;
-    log("info", `date rollover detected: ${state.cachedTodayUid} \u2192 ${newToday}`);
+    const oldToday = state.cachedTodayUid;
+    log("info", `date rollover detected: ${oldToday} \u2192 ${newToday}`);
     state.cachedTodayUid = newToday;
+    if (oldToday && oldToday !== state.navigationPageUid) unregisterWatch(oldToday);
     registerWatch(newToday, "rollover-today");
     const newTomorrow = tomorrowPageUid();
     if (newTomorrow) registerWatch(newTomorrow, "rollover-tomorrow");
+    onPageNavigation().catch((e) => debug("rollover navigation refresh failed", e?.message || e));
   }
   async function periodicSweep() {
     if (!state.settings.enabled) return;
     debug(`periodic sweep over ${state.activeWatches.size} watched pages`);
     for (const [pageUid] of state.activeWatches) {
       try {
-        await reconcileTimeBlock(pageUid, "sweep");
+        await runReconcile(pageUid, "sweep");
       } catch (e) {
         debug(`sweep reconcile failed on ${pageUid}`, e?.message || e);
       }
     }
   }
-  function onPageNavigation() {
+  async function onPageNavigation() {
     if (!state.settings.enabled) return;
     let openUid;
     try {
-      openUid = window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid();
+      openUid = await window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid();
     } catch {
       return;
     }
-    if (!openUid) return;
+    let offset = null;
     const window_ = state.settings.historicalWindowDays;
     for (let i = -window_; i <= 1; i++) {
       if (openUid === offsetPageUid(i)) {
-        registerWatch(openUid, `nav-${i}`);
-        return;
+        offset = i;
+        break;
       }
     }
+    const today = state.cachedTodayUid || todayPageUid();
+    const tomorrow = tomorrowPageUid();
+    const nextHistorical = offset !== null && openUid !== today && openUid !== tomorrow ? openUid : null;
+    if (state.navigationPageUid && state.navigationPageUid !== nextHistorical && state.navigationPageUid !== today && state.navigationPageUid !== tomorrow) {
+      unregisterWatch(state.navigationPageUid);
+    }
+    state.navigationPageUid = nextHistorical;
+    if (offset !== null && openUid) registerWatch(openUid, `nav-${offset}`);
   }
   function attachNavigationListener() {
     if (state.navigationListenerAttached) return;
-    const handler = () => onPageNavigation();
+    const handler = () => onPageNavigation().catch(
+      (e) => debug("navigation refresh failed", e?.message || e)
+    );
     window.addEventListener("hashchange", handler);
     state._navHandler = handler;
     state.navigationListenerAttached = true;
@@ -1063,14 +1280,14 @@ function createLegacyRuntime({ extensionAPI }) {
     add("TimeBlock Organizer: show conflicts on current page", async () => {
       let openUid;
       try {
-        openUid = window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid();
+        openUid = await window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid();
       } catch {
       }
       if (!openUid) return log("warn", "no open page detected");
       const tbUid = findTimeBlockUid(openUid);
       if (!tbUid) return log("info", `no TimeBlock parent on ${openUid}`);
       const finalChildren = getDirectChildren(tbUid);
-      const todos = finalChildren.filter((c) => isTimePrefixed(c.string));
+      const todos = finalChildren.filter((c) => isTimePrefixed(c.string) && !isActiveSession(c.string));
       const conflicts = detectOverlaps(todos);
       const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
       const { deadEnds } = resolveConflicts(todos, cutoff);
@@ -1101,17 +1318,17 @@ function createLegacyRuntime({ extensionAPI }) {
     add("TimeBlock Organizer: reconcile current page now", async () => {
       let openUid;
       try {
-        openUid = window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid();
+        openUid = await window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid();
       } catch {
       }
       if (!openUid) return log("warn", "no open page detected");
-      await reconcileTimeBlock(openUid, "manual");
+      await runReconcile(openUid, "manual");
     });
     add("TimeBlock Organizer: reconcile today + tomorrow", async () => {
       const today = todayPageUid();
       const tomorrow = tomorrowPageUid();
-      if (today) await reconcileTimeBlock(today, "manual-today");
-      if (tomorrow) await reconcileTimeBlock(tomorrow, "manual-tomorrow");
+      if (today) await runReconcile(today, "manual-today");
+      if (tomorrow) await runReconcile(tomorrow, "manual-tomorrow");
     });
     add("TimeBlock Organizer: show stats (current settings)", () => {
       const onOff = (b) => b ? "ON " : "OFF";
@@ -1127,12 +1344,14 @@ function createLegacyRuntime({ extensionAPI }) {
         `  ${onOff(state.settings.autoResolveConflicts)} auto-resolve conflicts (Phase 3, opt-in)`,
         ``,
         `\u2500\u2500 runtime \u2500\u2500`,
-        `  Active watches: ${state.activeWatches.size} / ${state.settings.maxActiveWatches}`,
+        `  Watched pages: ${state.activeWatches.size} / ${state.settings.maxActiveWatches}`,
+        `  Owned pull watches: ${Array.from(state.activeWatches.values()).reduce((n, w) => n + 1 + (w.timeBlockUid ? 1 : 0), 0)}`,
         `  Pending reconciles: ${state.pendingReconciles.size}`,
+        `  In-flight reconciles: ${state.inFlightReconciles.size}`,
         `  Today UID: ${state.cachedTodayUid || "(none)"}`,
         `  TimeBlock signature: ${state.settings.timeblockSignature.slice(0, 60)}...`,
         `  SmartBlock button: ${state.settings.smartblockButtonSignature}`,
-        `  Debounce: ${state.settings.debounceMs}ms / sweep: ${state.settings.sweepIntervalMs / 6e4}min`,
+        `  Debounce: page ${state.settings.debounceMs}ms / TimeBlock ${state.settings.timeblockDebounceMs}ms / sweep ${state.settings.sweepIntervalMs / 6e4}min`,
         `  Conflict strategy: ${state.settings.conflictStrategy} / cutoff: ${state.settings.cascadeCutoffTime} / pinned marker: ${state.settings.pinnedMarker}`,
         ``,
         `Watched pages:`,
@@ -1151,6 +1370,7 @@ function createLegacyRuntime({ extensionAPI }) {
     add("TimeBlock Organizer: list active watches (debug)", () => {
       console.table(Array.from(state.activeWatches.entries()).map(([uid, w]) => ({
         page_uid: uid,
+        timeblock_uid: w.timeBlockUid || "",
         registered_at: new Date(w.registeredAt).toLocaleString(),
         last_used_sec_ago: Math.round((Date.now() - w.lastUsed) / 1e3)
       })));
@@ -1176,6 +1396,7 @@ function createLegacyRuntime({ extensionAPI }) {
       const tomorrow = tomorrowPageUid();
       if (tomorrow) registerWatch(tomorrow, "init-tomorrow");
       attachNavigationListener();
+      onPageNavigation().catch((e) => debug("initial navigation refresh failed", e?.message || e));
       state.rolloverTimer = setInterval(checkRollover, state.settings.rolloverCheckMs);
       state.sweepTimer = setInterval(() => {
         periodicSweep().catch((e) => log("warn", "sweep threw", e?.message || e));
@@ -1191,13 +1412,11 @@ function createLegacyRuntime({ extensionAPI }) {
     if (state.sweepTimer) clearInterval(state.sweepTimer);
     for (const t of state.pendingReconciles.values()) clearTimeout(t);
     state.pendingReconciles.clear();
-    for (const [uid, w] of state.activeWatches) {
-      try {
-        w.unsub();
-      } catch {
-      }
-    }
-    state.activeWatches.clear();
+    for (const uid of [...state.activeWatches.keys()]) unregisterWatch(uid);
+    state.inFlightReconciles.clear();
+    state.dirtyReconciles.clear();
+    state.suppressUntilByPage.clear();
+    state.navigationPageUid = null;
     detachNavigationListener();
     if (state.registeredCommandLabels) {
       for (const label of state.registeredCommandLabels) {
@@ -1261,14 +1480,31 @@ function createLegacyRuntime({ extensionAPI }) {
       resolveConflicts,
       formatMinAsHHMM,
       stripLeadingNoise,
+      activeSessionStart,
+      isActiveSession,
+      buildTimeBlockSignatureRegex,
+      buildMinimalMovePlan,
+      computeDesiredOrder,
+      reconcileTimeBlock,
+      runReconcile,
+      registerWatch,
+      unregisterWatch,
+      onPageNavigation,
+      pageWatchFingerprint,
+      timeBlockWatchFingerprint,
       /* v1.1.7 — pure ordering kernel, extracted so the sort contract is
        * testable without a live graph. computeDesiredOrder does the same
        * bucketing against real block records; this takes plain strings. */
       sortTimedEntries(items) {
         let seq = 0;
-        const keyed = [], untimed = [];
+        const keyed = [], untimed = [], active = [];
         for (const it of items) {
           const s = typeof it === "string" ? it : it.string;
+          const activeStart = activeSessionStart(s);
+          if (activeStart !== null) {
+            active.push({ it, start: activeStart, seq: seq++ });
+            continue;
+          }
           const strict = parseTimePrefix(s);
           if (strict) {
             keyed.push({ it, start: strict.startMin, end: strict.endMin, seq: seq++ });
@@ -1282,14 +1518,15 @@ function createLegacyRuntime({ extensionAPI }) {
           untimed.push(it);
         }
         keyed.sort((a, b) => a.start - b.start || a.end - b.end || a.seq - b.seq);
-        return { timed: keyed.map((x) => x.it), untimed };
+        active.sort((a, b) => a.start - b.start || a.seq - b.seq);
+        return { timed: keyed.map((x) => x.it), untimed, active: active.map((x) => x.it) };
       }
     }
   };
 }
 
 // src/extension.js
-var VERSION = "1.1.6";
+var VERSION = "1.1.8";
 var SETTINGS_KEY = "settings";
 var activeRuntime = null;
 async function setInitial(extensionAPI, id, value) {
