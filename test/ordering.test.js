@@ -103,14 +103,14 @@ test("unfinished Elapsed Time sessions stay in the Now lane until closed", () =>
   assert.deepEqual(finished.timed, [closed, "08:00 - 09:00 planned"]);
 });
 
-test("unfinished Elapsed Time sessions are excluded from conflict resolution", () => {
+test("unfinished Elapsed Time sessions are excluded from conflict detection", () => {
   const h = helpers();
   const active = { uid: "active", string: "09:30 {{⇥🕞:SmartBlock:Elapsed time}} working" };
-  const result = h.resolveConflicts([
+  const result = h.detectOverlaps([
     { uid: "plan", string: "09:00 - 10:00 planned" },
     active,
-  ], 23 * 60);
-  assert.deepEqual(result, { updates: [], deadEnds: [] });
+  ]);
+  assert.deepEqual(result, []);
 });
 
 test("minimal fallback moves only displaced children", () => {

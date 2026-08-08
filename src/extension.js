@@ -1,54 +1,74 @@
 import { createLegacyRuntime } from "./core.js";
 
-export const VERSION = "1.1.8";
-export const SETTINGS_KEY = "settings";
+export const VERSION = "1.2.0";
+export const SETTINGS_MIGRATION_VERSION = 2;
+export const SETTINGS_MIGRATION_KEY = "settings-migration-version";
+const LEGACY_SNAPSHOT_KEY = "settings";
+
+export const SETTING_SPECS = [
+  { id: "enabled", key: "enabled", defaultValue: true },
+  { id: "persistent-conflict-output", key: "persistentConflictOutput", defaultValue: false },
+  { id: "timeblock-signature", key: "timeblockSignature", defaultValue: "#TimeBlock" },
+  { id: "active-session-signature", key: "activeSessionSignature", defaultValue: "{{⇥🕞:SmartBlock:Elapsed time}}" },
+  { id: "smartblock-button-signature", key: "smartblockButtonSignature", defaultValue: "{{🕗↦:SmartBlock:Double timestamp buttons2}}" },
+  { id: "ignore-overlap-markers", key: "conflictIgnoreMarkers", defaultValue: "#calendar, #concurrent, #no-conflict" },
+  { id: "loose-sort-fallback", key: "looseSortFallback", defaultValue: true },
+  { id: "untimed-at-bottom", key: "untimedAtBottom", defaultValue: true },
+];
+
 let activeRuntime = null;
 
-async function setInitial(extensionAPI, id, value) {
-  if (extensionAPI.settings.get(id) == null && extensionAPI.settings.canSet !== false) {
-    await extensionAPI.settings.set(id, value);
-  }
-  const stored = extensionAPI.settings.get(id);
-  return stored == null ? value : stored;
+function canonicalSettings(extensionAPI) {
+  return Object.fromEntries(SETTING_SPECS.map(spec => {
+    const saved = extensionAPI.settings.get(spec.id);
+    return [spec.key, saved == null ? spec.defaultValue : saved];
+  }));
 }
 
 export async function migrateSettings({ extensionAPI, runtime }) {
-  const legacy = runtime.readLegacySettings();
-  let snapshot = extensionAPI.settings.get(SETTINGS_KEY);
-  if (!snapshot || typeof snapshot !== "object") {
-    snapshot = { ...legacy };
-    if (extensionAPI.settings.canSet !== false) await extensionAPI.settings.set(SETTINGS_KEY, snapshot);
+  const marker = extensionAPI.settings.get(SETTINGS_MIGRATION_KEY);
+  if (marker !== SETTINGS_MIGRATION_VERSION && extensionAPI.settings.canSet !== false) {
+    const legacy = runtime.readLegacySettings();
+    const snapshot = extensionAPI.settings.get(LEGACY_SNAPSHOT_KEY);
+    const oldDepot = snapshot && typeof snapshot === "object" ? snapshot : {};
+
+    for (const spec of SETTING_SPECS) {
+      if (extensionAPI.settings.get(spec.id) != null) continue;
+      let value = oldDepot[spec.key] ?? legacy[spec.key] ?? spec.defaultValue;
+      // The old status setting was auto-seeded true, so intent is unknowable.
+      // A new ID and explicit false policy make persistent output genuinely opt-in.
+      if (spec.key === "persistentConflictOutput") value = false;
+      if (spec.key === "conflictIgnoreMarkers") value = spec.defaultValue;
+      await extensionAPI.settings.set(spec.id, value);
+    }
+    // Marker last: a partial write safely retries next load.
+    await extensionAPI.settings.set(SETTINGS_MIGRATION_KEY, SETTINGS_MIGRATION_VERSION);
+    try { localStorage.removeItem("timeblock-organizer:settings"); } catch {}
   }
-  const effective = { ...legacy, ...snapshot };
+
+  const effective = canonicalSettings(extensionAPI);
   runtime.applySettings(effective);
   return effective;
 }
 
-async function createPanel(extensionAPI, runtime, effective) {
-  const toggles = [
-    ["enabled", "enabled", "Enabled", "Watch daily pages and keep TimeBlock children organized."],
-    ["conflict-detection", "conflictDetection", "Conflict detection", "Detect overlapping time ranges."],
-    ["conflict-status", "conflictStatusBlock", "Conflict status block", "Write a status block when conflicts exist."],
-    ["auto-resolve", "autoResolveConflicts", "Auto-resolve conflicts", "Bump later items forward. Off by default."],
-    ["dry-run", "dryRun", "Dry run", "Log intended moves without writing them."],
-    ["verbose", "verbose", "Verbose logging", "Print reconciliation diagnostics."],
-  ];
-  for (const [id, key] of toggles) effective[key] = await setInitial(extensionAPI, id, effective[key]);
-  runtime.applySettings(effective);
-  const change = (key) => async (event) => {
-    runtime.setSetting(key, Boolean(event.target.checked));
-    if (extensionAPI.settings.canSet !== false) {
-      await extensionAPI.settings.set(SETTINGS_KEY, runtime.getSettings());
-    }
-  };
+async function createPanel(extensionAPI, runtime) {
+  const change = key => event => runtime.setSetting(key, Boolean(event.target.checked));
   await extensionAPI.settings.panel.create({
     tabTitle: "TimeBlock Organizer",
-    settings: toggles.map(([id, key, name, description]) => ({
-      id,
-      name,
-      description,
-      action: { type: "switch", onChange: change(key) },
-    })),
+    settings: [
+      {
+        id: "enabled",
+        name: "Enabled",
+        description: "Organize TimeBlock entries during active work sessions.",
+        action: { type: "switch", onChange: change("enabled") },
+      },
+      {
+        id: "persistent-conflict-output",
+        name: "Persistent conflict output",
+        description: "Write a conflict summary on Daily Notes. Manual conflict inspection remains available when off.",
+        action: { type: "switch", onChange: change("persistentConflictOutput") },
+      },
+    ],
   });
 }
 
@@ -57,8 +77,8 @@ export async function onload({ extensionAPI, extension }) {
   const runtime = createLegacyRuntime({ extensionAPI });
   activeRuntime = runtime;
   try {
-    const effective = await migrateSettings({ extensionAPI, runtime });
-    await createPanel(extensionAPI, runtime, effective);
+    await migrateSettings({ extensionAPI, runtime });
+    await createPanel(extensionAPI, runtime);
     runtime.start();
     console.info(`[timeblock-organizer] loaded v${extension?.version || VERSION}`);
   } catch (error) {

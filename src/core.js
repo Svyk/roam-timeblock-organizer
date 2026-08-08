@@ -1,188 +1,41 @@
-/* timeblock-organizer v1.1.8
+/* timeblock-organizer v1.2.0
  *
- * v1.1.8 — Continuous, low-overhead organization. TimeBlock parent tags are
- *   matched as standalone tokens anywhere in the parent string, so the live
- *   `Schedule #TimeBlock` convention works. Watched pages now get a second,
- *   shallow watch on the TimeBlock itself; structural changes are reconciled
- *   after a short debounce while description-only typing is ignored. Open
- *   Elapsed Time sessions stay in a stable "Now" lane above the launcher and
- *   sort chronologically only after they close. Reordering uses Roam's
- *   one-write `block.reorderBlocks` API when available, with a minimal-move
- *   fallback. Watches are bounded to today, tomorrow, and one open historical
- *   page, reconciles are single-flight, and self-write suppression is per-page.
+ * Organizes direct children beneath standalone #TimeBlock parents with two
+ * shallow watches per active Daily Note. Completed ranges sort chronologically;
+ * unfinished Elapsed Time sessions remain in a stable Now lane; the permanent
+ * launcher remains last. Conflict inspection is read-only. Persistent status
+ * output is opt-in and idempotent. Startup, visibility resume, and hourly
+ * today-only recovery cover missed events without graph-wide polling.
  *
- * v1.1.6 — Expanded conflict-ignore tag list. The original v1.1.4 `#concurrent`
- *   marker was a single-tag opt-out, but real overlaps include several
- *   non-conflicting categories that all deserve the same treatment:
- *     - Calendar / agenda-anchor events that already account for parallel work
- *       (you tag them `#calendar` so the planner sees them, but they shouldn't
- *       flag conflicts with real focus blocks)
- *     - All-day events (`#allday` / `#all-day`) — they span the whole day by
- *       definition and conflicting with them is meaningless
- *     - Early-out / leaving-early markers (`#leaving-early` / `#early-out`) —
- *       they're flags on the schedule, not conflicting time blocks
- *   New setting `conflictIgnoreMarkers` is a comma-separated list with sensible
- *   defaults. If EITHER block in an overlapping pair contains ANY of the
- *   listed tags (including the existing `concurrentMarker`), the pair is
- *   skipped in `detectOverlaps`. The existing `concurrentMarker` setting still
- *   works (its single value is merged into the ignore list on every reconcile),
- *   so no settings-page migration is needed for v1.1.5 users.
- *
- * v1.1.5 — Hotfix: TimeBlock parent detection broken by Nautilus retirement
- *   (Roam block ((bw1QibZxU)) on 2026-05-07). The default `timeblockSignature`
- *   was the legacy Nautilus render prefix
- *   (`"#TimeBlock {{[[roam/render]]:((roam-render-Nautilus-cljs))"`). After the
- *   render component was retired, daily-page TimeBlock parents became plain
- *   `#TimeBlock` blocks, which no longer matched the prefix → `findTimeBlockUid`
- *   returned null → reconcile silently no-op'd, leaving entries unsorted.
- *   Fix: `timeblockSignature` is now a TAG (`#TimeBlock` default), and
- *   `findTimeBlockUid` matches `^<tag>(\s|$)` — accepts both legacy form
- *   (with the render text after a space) AND the new plain form. Excludes
- *   accidental matches like `#TimeBlocked`. Existing user settings on
- *   [[TimeBlock Organizer Settings]] with the old long-prefix value need
- *   to be edited to just `#TimeBlock` for the matcher to pick up the new
- *   regex form (the user's settings-page value still wins over DEFAULTS).
- *
- * v1.1.4 — Three improvements driven by 2026-05-06 use:
- *   (a) `#concurrent` opt-out for intentional overlaps. The Phase 2 conflict
- *       detector flagged every overlapping pair, but sometimes Svyat is
- *       working on two things at once (long meeting + flexible Plodding
- *       task running in parallel) and the `**TimeBlock Conflicts**` status
- *       block is just noise. New `concurrentMarker` setting (default
- *       `#concurrent`) — if EITHER block in an overlapping pair contains
- *       the marker, the pair is skipped in `detectOverlaps`. The
- *       `#pinned-time` mechanism (which only blocks auto-bumping) is
- *       unchanged — `#concurrent` is a separate, narrower opt-out that
- *       suppresses the warning entirely.
- *   (b) Loose-sort fallback for incomplete time entries. The strict
- *       parseTimePrefix has three regexes (range, TODO-prefixed, single
- *       timestamp), all requiring `\s+(?=\S)` after the time — so entries
- *       like bare `19:00 ` (just the time, no description yet) or
- *       `{{[[TODO]]}} 19:00 thing` (time mid-text after a tool marker)
- *       fall through to "untimed" and historically got parked at the top
- *       of the TimeBlock as `tbOther`. New `looseParseTimePrefix` scans
- *       the first 30 chars for any HH:MM and returns it as a sort hint
- *       only — never used to rewrite the block. Default ON via
- *       `looseSortFallback`. Entries that even loose-parsing can't time
- *       still bucket to "untimed".
- *   (c) Untimed entries park at BOTTOM, not top. Before v1.1.4 anything
- *       that didn't parse as time-prefixed was placed at the start of the
- *       TimeBlock (the design intent was "park unsorted stuff visible at
- *       the top"), but practically it pushed every real time-entry down a
- *       row and made the day's chronology start at item 2+. Default
- *       `untimedAtBottom: true` flips it: incomplete drafts drift to the
- *       end where they're easy to finish, real entries lead the timeline.
- *       Set `untimedAtBottom:: false` on the settings page to restore the
- *       legacy ordering.
- *
- * v1.1.3 — Two parser fixes that left entries stuck out of order at the
- *   top of TimeBlock children, surfaced by a 2026-05-02 reconcile of
- *   ((oNbgd_kU2)):
- *   (a) `eh > 23` rejection of 24:00 end times. `23:30 - 24:00 EOD wrap`
- *       failed parseTimePrefix, got bucketed as tbOther, parked at the top
- *       of the sorted output. 24:00 is canonical end-of-day (1440 min) and
- *       should be valid as an END time (not a start). Now allows eh=24
- *       only when em=0; eh > 24 or 24:01+ stays invalid.
- *   (b) Single-timestamp entries (no range) like `20:51 {{⇥🕞:SmartBlock:
- *       Elapsed time}} ...` from SmartBlock click-loggers were treated as
- *       tbOther and parked at the top. Added SINGLE_TIME_PREFIX_RE as the
- *       third parse fallback. Treated as zero-duration points: sort by
- *       start time, never overlap (filter on endMin > startMin in
- *       detectOverlaps), never auto-bumped (rewriteTimePrefix doesn't
- *       handle the single shape — leaves them where the user put them).
- *
- * v1.1.2 — Chief of Staff compatibility. COS's `roam_create_todo` tool
- *   prepends `{{[[TODO]]}} ` to whatever text the agent passes, so a COS-
- *   scheduled item ends up shaped `{{[[TODO]]}} HH:MM - HH:MM description`
- *   — TODO marker FIRST, time range SECOND. v1.1.1's regex required the
- *   time range to be at position 0 of the string, so COS items got treated
- *   as `tbOther` and never sorted. Added TODO_TIME_PREFIX_RE that catches
- *   the marker-first shape. parseTimePrefix tries canonical first, falls
- *   back to tool-prefixed. rewriteTimePrefix preserves whichever shape was
- *   used (won't rewrite COS output to canonical — that'd surprise the user).
- *   Now reconciles + sorts ANY writer's output: COS, Better Tasks dropdowns,
- *   manual edits, future skills.
- *
- * v1.1.1 — Bugfix: relaxed TIME_PREFIX_RE so it matches all five canonical
- *   TimeBlock entry formats, not just inline-TODO entries. The prior regex
- *   required `HH:MM - HH:MM ` followed IMMEDIATELY by `{{[[TODO]]}}`, which
- *   excluded:
- *     - block-ref entries: `HH:MM - HH:MM ((uid))`
- *     - markdown-link wrapped block refs: `HH:MM - HH:MM [text](((uid)))`
- *     - meeting/event entries: `HH:MM - HH:MM **call with X**`
- *     - any plain-text time-prefixed line
- *   Fix: regex now matches `HH:MM - HH:MM ` followed by any content (positive
- *   lookahead `(?=\S)`). Bare `HH:MM - HH:MM` alone with no description still
- *   doesn't match (intentional — incomplete entry). rewriteTimePrefix
- *   simplified to a literal string replacement; no longer rebuilds TODO/DONE
- *   markers from scratch (they live AFTER the prefix and survive verbatim).
- *   Repro that prompted the fix: ((HU-11_ihG)) — `23:00 - 23:45 [{{[[TODO]]}}
- *   ...](((OImadoY9X))) #important` was sitting mid-stack in TimeBlock when
- *   it should've sorted to position N-1 (just before the SmartBlock button).
- *
- * v1.1.0 — Phase 2 + Phase 3 ship.
- *   Phase 2 (conflict detection): after each reconcile, scan the sorted
- *   TimeBlock children for overlapping time ranges. If conflicts exist,
- *   write a `**TimeBlock Conflicts** (N) #timeblock-status` block as the
- *   LAST child of the daily page with one bullet per overlapping pair
- *   (e.g. `09:00-10:00 "EMP review" overlaps 09:30-10:30 "swab walk" —
- *   30min`). Block is auto-deleted when zero conflicts remain. Always-on
- *   console warning regardless of status-block setting.
- *   Phase 3 (auto-resolve, opt-in): when `auto_resolve_conflicts` is on
- *   and `conflict_strategy` is `bump_forward`, the script rewrites the
- *   later item's time prefix to start at the earlier item's end, cascading
- *   forward. Refuses (and reports as a dead-end in the status block) if
- *   the cascade pushes past `cascade_cutoff_time` (default 23:00). Items
- *   tagged with `#pinned-time` are skipped (you decided their time
- *   intentionally; we won't move them).
- *
- * v1.0.0 — Phase 1: watches daily pages and reorganizes time-prefixed
- *   TODOs into the #TimeBlock parent, sorted by start-time. Pins the
- *   SmartBlock timestamp button as last child. Pull-watches today +
- *   tomorrow + historically-visited daily pages within a window. LRU-
- *   capped, debounced, idempotent.
- *
- * Bug it solves: when COS (or any tool) writes a `14:00 - 15:00 {{[[TODO]]}}
- * foo` block to today's daily page as a direct page-level child, this
- * plugin's pull-watch fires, the block gets moved under TimeBlock at the
- * right time-sorted position, the SmartBlock button stays pinned at the
- * end, and (v1.1.0) any time conflicts get reported / auto-resolved.
- *
- * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
+ * No LLM call. Narrow Roam pulls plus bounded block.move/reorderBlocks writes.
  */
 export function createLegacyRuntime({ extensionAPI }) {
   const commandPaletteApi = extensionAPI?.ui?.commandPalette ?? window.roamAlphaAPI?.ui?.commandPalette;
-  const VERSION = "1.1.8";
+  const VERSION = "1.2.0";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
   const DEFAULTS = {
     enabled: true,
-    debounceMs: 8000,                      // coalesce burst writes
-    timeblockDebounceMs: 1500,             // fast trailing debounce for relevant TimeBlock changes
-    historicalWindowDays: 7,               // how far back to auto-watch on navigation
-    maxActiveWatches: 14,                  // hard safety cap; normal operation watches <=3 pages
     timeblockSignature: "#TimeBlock",
     activeSessionSignature: "{{⇥🕞:SmartBlock:Elapsed time}}",
     smartblockButtonSignature: "{{🕗↦:SmartBlock:Double timestamp buttons2}}",
-    sweepIntervalMs: 5 * 60_000,           // periodic reconcile in case watches miss edits
-    rolloverCheckMs: 60_000,               // how often to check for date rollover
-    suppressMs: 2000,                      // ignore watch fires from our own writes
-    dryRun: false,                         // log moves without executing
-    verbose: false,
-    // v1.1.0 Phase 2: conflict detection
-    conflictDetection: true,               // scan for overlapping ranges after each reconcile
-    conflictStatusBlock: true,             // write a status block on the daily page
-    // v1.1.0 Phase 3: auto-resolve (opt-in)
-    autoResolveConflicts: false,           // off by default — you might WANT overlaps
-    conflictStrategy: "bump_forward",      // only one strategy supported for now
-    cascadeCutoffTime: "23:00",            // refuse to bump past this (HH:MM)
-    pinnedMarker: "#pinned-time",          // items with this tag don't get bumped
-    // v1.1.4
-    concurrentMarker: "#concurrent",       // overlap pair where EITHER block has this tag is intentional — skip the conflict warning
-    conflictIgnoreMarkers: "#calendar, #calender, #allday, #all-day, #leaving-early, #early-out, #out-early", // v1.1.6: comma-separated additional ignore tags. Merged with `concurrentMarker` on every reconcile. Calendar/all-day/early-out events are flags on the schedule, not real conflicts.
+    persistentConflictOutput: false,
+    conflictIgnoreMarkers: "#calendar, #concurrent, #no-conflict",
     looseSortFallback: true,               // when strict regex fails, scan first 30 chars for HH:MM and sort by that anyway (catches in-progress edits like "19:00 " or "{{[[TODO]]}} 19:00 thing"); never rewrites the block
     untimedAtBottom: true,                 // when an entry can't be timed even loosely, park it at the BOTTOM of the TimeBlock (not the top — that was the surprise)
+  };
+
+  // Safety limits are implementation details, not user settings. Keeping them
+  // fixed prevents an innocent preference edit from multiplying Roam work.
+  const RUNTIME = {
+    pageDebounceMs: 8000,
+    timeblockDebounceMs: 1500,
+    historicalWindowDays: 7,
+    maxWatchedPages: 3,
+    recoveryIntervalMs: 60 * 60_000,
+    rolloverCheckMs: 60_000,
+    suppressMs: 2000,
   };
 
   const state = {
@@ -193,267 +46,33 @@ export function createLegacyRuntime({ extensionAPI }) {
     inFlightReconciles: new Map(),         // pageUid → active reconcile promise
     dirtyReconciles: new Map(),            // pageUid → latest reason received in flight
     suppressUntilByPage: new Map(),        // pageUid → ignore own watch callbacks until timestamp
-    sweepTimer: null,
+    recoveryTimer: null,
     rolloverTimer: null,
     cachedTodayUid: null,
     navigationPageUid: null,
     navigationListenerAttached: false,
+    visibilityListenerAttached: false,
+    monitoringActive: false,
     registeredCommandLabels: new Set(),
   };
 
   const log = (lvl, msg, data) =>
     console[lvl](`[${NAMESPACE}] ${msg}`, data ?? "");
-  const sk = (k) => `${NAMESPACE}:${k}`;
-  const debug = (msg, data) => { if (state.settings.verbose) log("debug", msg, data); };
-
-  /* ---------- Settings ---------- */
-  const GRAPH_SETTINGS = [
-    ["enabled",                     "enabled",                   "bool",   true,
-      "Master switch. false = no watches, no reconciles, the plugin is dormant."],
-    ["debounce_ms",                 "debounceMs",                "int",    8000,
-      "ms to wait after a daily-page change before reconciling. Coalesces burst writes from COS / Better Tasks."],
-    ["timeblock_debounce_ms",       "timeblockDebounceMs",       "int",    1500,
-      "Trailing debounce for organizer-relevant changes inside TimeBlock. Description-only typing is ignored before this timer is scheduled."],
-    ["historical_window_days",      "historicalWindowDays",      "int",    7,
-      "How many days back to auto-register watches when you navigate to a historical daily page. 0 = today + tomorrow only."],
-    ["max_active_watches",          "maxActiveWatches",          "int",    14,
-      "Hard cap on simultaneously-watched daily pages. Normal operation watches today, tomorrow, and at most one open historical page (three total)."],
-    ["timeblock_signature",         "timeblockSignature",        "string", DEFAULTS.timeblockSignature,
-      "Standalone TAG that identifies the TimeBlock parent anywhere in its text. Default `#TimeBlock`; matches `#TimeBlock` and `Schedule #TimeBlock`, but not `#TimeBlocked`. Edit if you renamed the tag (e.g. `#tb`)."],
-    ["active_session_signature",    "activeSessionSignature",     "string", DEFAULTS.activeSessionSignature,
-      "Exact marker used by an unfinished Elapsed Time SmartBlock session. Active sessions stay in the Now lane immediately above the permanent timestamp launcher until closed."],
-    ["smartblock_button_signature", "smartblockButtonSignature", "string", DEFAULTS.smartblockButtonSignature,
-      "Exact string of the SmartBlock timestamp-button block that must always be the last child of TimeBlock. If you renamed it, paste the new exact string here."],
-    ["sweep_interval_ms",           "sweepIntervalMs",           "int",    300000,
-      "Low-frequency recovery sweep over the bounded watched pages. Direct TimeBlock watches are the primary path; this only recovers from missed callbacks or temporary API failures."],
-    ["rollover_check_ms",           "rolloverCheckMs",           "int",    60000,
-      "How often to check whether the date has rolled over (so today's daily page changes uid)."],
-    ["suppress_ms",                 "suppressMs",                "int",    2000,
-      "After we issue our own block.move calls, ignore watch callbacks for this many ms (avoids self-triggered loops)."],
-    ["dry_run",                     "dryRun",                    "bool",   false,
-      "Log every move that WOULD be executed, without actually moving blocks. Useful for previewing behavior."],
-    ["verbose",                     "verbose",                   "bool",   false,
-      "Verbose console logging. Off by default — most operations are silent."],
-    // Phase 2: conflict detection
-    ["conflict_detection",          "conflictDetection",         "bool",   true,
-      "After each reconcile, scan TimeBlock children for overlapping time ranges. Off = no conflict warnings at all."],
-    ["conflict_status_block",       "conflictStatusBlock",       "bool",   true,
-      "Write a `**TimeBlock Conflicts** (N) #timeblock-status` block on the daily page when overlaps exist. Auto-deleted when zero conflicts. Off = console-only warnings."],
-    // Phase 3: auto-resolve
-    ["auto_resolve_conflicts",      "autoResolveConflicts",      "bool",   false,
-      "Auto-rewrite conflicting time prefixes (bump the later item forward by the overlap). OFF by default — you might intentionally want overlaps. Only takes effect when conflict_detection is also on."],
-    ["conflict_strategy",           "conflictStrategy",          "string", "bump_forward",
-      "Resolution strategy. Only `bump_forward` supported in v1.1.0 — push the later item's start to the earlier item's end, cascading forward."],
-    ["cascade_cutoff_time",         "cascadeCutoffTime",         "string", "23:00",
-      "If a cascade would push an item to start past this time (HH:MM, 24h), refuse the resolution and flag the item as a dead-end in the status block. Default 23:00 (no scheduling past 11pm)."],
-    ["pinned_marker",               "pinnedMarker",              "string", "#pinned-time",
-      "Substring/tag that marks an item as user-pinned. Pinned items are NEVER auto-bumped, even if they're the cause of a cascade dead-end. Add this tag to a TODO to lock its time."],
-    // v1.1.4 ──────────────────────────────────────────────────────────────────
-    ["concurrent_marker",           "concurrentMarker",          "string", "#concurrent",
-      "Substring/tag for blocks that may legitimately overlap. If EITHER block in an overlapping pair contains this tag, the pair is treated as intentional concurrent work and is NOT flagged in the **TimeBlock Conflicts** status block. Use when you're working on two things at once (e.g. a long meeting that runs in parallel with a flexible Plodding task)."],
-    // v1.1.6 ──────────────────────────────────────────────────────────────────
-    ["conflict_ignore_markers",     "conflictIgnoreMarkers",     "string", "#calendar, #calender, #allday, #all-day, #leaving-early, #early-out, #out-early",
-      "Comma-separated list of additional tags whose presence on EITHER block in an overlapping pair causes the pair to be skipped in conflict detection. Merged with the single `concurrent_marker` setting on every reconcile. Defaults cover calendar/agenda anchors, all-day events, and early-departure markers — none of those should flag as time conflicts with real focus blocks. Add/remove tags as needed. Leave empty to disable the multi-tag list (then only `concurrent_marker` applies)."],
-    ["loose_sort_fallback",         "looseSortFallback",         "bool",   true,
-      "When strict regex fails (incomplete entries like '19:00 ' with nothing after, or '{{[[TODO]]}} 19:00 thing' with the time mid-text), scan the first 30 chars for any HH:MM and sort the block by that time anyway. Never rewrites the block — sort-only. Off = old strict behavior where any non-strict block lands in the bucketed group."],
-    ["untimed_at_bottom",           "untimedAtBottom",           "bool",   true,
-      "Park entries that can't be timed (even with loose-sort fallback) at the BOTTOM of the TimeBlock rather than the top. False = legacy behavior (untimed at top). Bottom is less surprising — incomplete entries drift to the end where you can finish them."],
-  ];
-
-  // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
-  //
-  // Source of truth for the [[<Plugin> Settings]] page pattern. Inlined into
-  // each plugin's script.js between the START/END markers via
-  // `bash sync-settings-lib.sh`. To update the helpers across all plugins:
-  //
-  //   1. Edit this file
-  //   2. Run `bash sync-settings-lib.sh` from the repo root
-  //   3. Commit + push (each plugin's script.js bytes change)
-  //
-  // Usage inside a plugin's IIFE:
-  //
-  //   const settingsMgr = createSettingsManager({
-  //     SETTINGS_PAGE,         // e.g. "Auto-Attribute Settings"
-  //     GRAPH_SETTINGS,        // [[graphKey, settingsKey, type, default, description], ...]
-  //     settingsRef: state.settings,
-  //     log,                   // function(level, msg, data)
-  //     sk: (k) => `${NAMESPACE}:${k}`,
-  //   });
-  //   const {
-  //     loadPersistentSettings, persistSettings,
-  //     loadAllSettingsFromGraph, persistSettingToGraph, ensureSettingsPage,
-  //   } = settingsMgr;
-  //
-  // The factory returns standalone functions that share access to `ctx` via
-  // closure — same behavior as the previous inline duplicated code. Drop-in
-  // replacement; existing call sites keep working.
-  function createSettingsManager(ctx) {
-    const { SETTINGS_PAGE, GRAPH_SETTINGS, settingsRef, log, sk } = ctx;
-  
-    function parseSettingValue(type, raw) {
-      if (raw == null) return null;
-      const s = String(raw).trim();
-      if (type === "bool") {
-        const lower = s.toLowerCase();
-        return lower === "true" || lower === "yes" || lower === "on" || lower === "1" || lower === "y";
-      }
-      if (type === "int") { const n = parseInt(s, 10); return Number.isFinite(n) ? n : null; }
-      if (type === "float") { const n = parseFloat(s); return Number.isFinite(n) ? n : null; }
-      return s;
-    }
-  
-    function formatSettingValue(type, value) {
-      if (type === "bool") return value ? "true" : "false";
-      return String(value);
-    }
-  
-    function loadPersistentSettings() {
-      try {
-        const raw = localStorage.getItem(sk("settings"));
-        if (!raw) return;
-        const stored = JSON.parse(raw);
-        for (const [, settingsKey] of GRAPH_SETTINGS) {
-          if (stored[settingsKey] !== undefined) settingsRef[settingsKey] = stored[settingsKey];
-        }
-      } catch (e) { log("warn", "loadPersistentSettings failed", e); }
-    }
-  
-    function persistSettings() {
-      try {
-        const obj = {};
-        for (const [, settingsKey] of GRAPH_SETTINGS) obj[settingsKey] = settingsRef[settingsKey];
-        localStorage.setItem(sk("settings"), JSON.stringify(obj));
-      } catch (e) { log("warn", "persistSettings failed", e); }
-    }
-  
-    function loadAllSettingsFromGraph() {
-      try {
-        const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
-        const rows = window.roamAlphaAPI.data.q(`
-          [:find ?s :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/string ?s]]
-        `);
-        const blocksByKey = {};
-        for (const r of rows) {
-          const s = (r[0] || "").trim();
-          const m = s.match(/^([a-z_][a-z0-9_]*)::\s*(.*)$/i);
-          if (m) blocksByKey[m[1]] = m[2];
-        }
-        let updated = 0;
-        for (const [graphKey, settingsKey, type] of GRAPH_SETTINGS) {
-          if (!(graphKey in blocksByKey)) continue;
-          const raw = blocksByKey[graphKey];
-          if (graphKey === "gemini_api_key" && (raw === "" || raw === "PASTE_YOUR_KEY_HERE")) continue;
-          const parsed = parseSettingValue(type, raw);
-          if (parsed === null) continue;
-          if (settingsRef[settingsKey] === parsed) continue;
-          settingsRef[settingsKey] = parsed;
-          updated++;
-        }
-        if (updated > 0) {
-          persistSettings();
-          log("info", `loaded ${updated} setting(s) from [[${SETTINGS_PAGE}]]`);
-        }
-        return updated;
-      } catch (e) { log("debug", "loadAllSettingsFromGraph failed", e); return 0; }
-    }
-  
-    async function ensureSettingsBlock(pageUid, graphKey, type, currentValue, description, order) {
-      const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
-      const rows = window.roamAlphaAPI.data.q(`
-        [:find ?u :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/uid ?u] [?b :block/string ?s] [(clojure.string/starts-with? ?s "${graphKey}::")]]
-      `);
-      let blockUid = rows?.[0]?.[0];
-      if (blockUid) return blockUid;
-      blockUid = window.roamAlphaAPI.util.generateUID();
-      const placeholder = (graphKey === "gemini_api_key" && !currentValue) ? "PASTE_YOUR_KEY_HERE" : formatSettingValue(type, currentValue);
-      await window.roamAlphaAPI.data.block.create({
-        location: { "parent-uid": pageUid, order },
-        block: { uid: blockUid, string: `${graphKey}:: ${placeholder}` },
-      });
-      const descUid = window.roamAlphaAPI.util.generateUID();
-      await window.roamAlphaAPI.data.block.create({
-        location: { "parent-uid": blockUid, order: 0 },
-        block: { uid: descUid, string: description },
-      });
-      return blockUid;
-    }
-  
-    async function persistSettingToGraph(graphKey) {
-      const row = GRAPH_SETTINGS.find(r => r[0] === graphKey);
-      if (!row) return;
-      const [, settingsKey, type] = row;
-      const value = settingsRef[settingsKey];
-      const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
-      try {
-        const rows = window.roamAlphaAPI.data.q(`
-          [:find ?u :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/uid ?u] [?b :block/string ?s] [(clojure.string/starts-with? ?s "${graphKey}::")]]
-        `);
-        const blockUid = rows?.[0]?.[0];
-        if (!blockUid) return;
-        await window.roamAlphaAPI.data.block.update({
-          block: { uid: blockUid, string: `${graphKey}:: ${formatSettingValue(type, value)}` },
-        });
-      } catch (e) { log("debug", `persistSettingToGraph(${graphKey}) failed`, e?.message || e); }
-    }
-  
-    async function ensureSettingsPage(openInSidebar = true) {
-      const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
-      let pageUid;
-      try {
-        const rows = window.roamAlphaAPI.data.q(`
-          [:find ?u :where [?p :node/title "${safeName}"] [?p :block/uid ?u]]
-        `);
-        pageUid = rows?.[0]?.[0];
-      } catch {}
-      if (!pageUid) {
-        pageUid = window.roamAlphaAPI.util.generateUID();
-        await window.roamAlphaAPI.data.page.create({ page: { title: SETTINGS_PAGE, uid: pageUid } });
-      }
-      const headerRows = window.roamAlphaAPI.data.q(`
-        [:find ?u :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/uid ?u] [?b :block/string ?s] [(clojure.string/starts-with? ?s "**How to use this page**")]]
-      `);
-      if (!headerRows?.[0]?.[0]) {
-        const headerUid = window.roamAlphaAPI.util.generateUID();
-        await window.roamAlphaAPI.data.block.create({
-          location: { "parent-uid": pageUid, order: 0 },
-          block: { uid: headerUid, string: "**How to use this page** — every setting below is `key:: value`. Edit the value inline (click the block, change the text, click out). The script reloads from this page on each scan cycle, or instantly via the matching cmd palette \"reload settings from graph\" command. Bool keys: `true` or `false`. Numbers as plain digits." },
-        });
-      }
-      let order = 1;
-      for (const [graphKey, settingsKey, type, , description] of GRAPH_SETTINGS) {
-        await ensureSettingsBlock(pageUid, graphKey, type, settingsRef[settingsKey], description, order);
-        order++;
-      }
-      if (openInSidebar) {
-        try { await window.roamAlphaAPI.ui.rightSidebar.addWindow({ window: { type: "outline", "block-uid": pageUid } }); }
-        catch (e) {
-          try { await window.roamAlphaAPI.ui.mainWindow.openPage({ page: { uid: pageUid } }); } catch {}
-        }
-      }
-      return pageUid;
-    }
-  
-    return {
-      parseSettingValue, formatSettingValue,
-      loadPersistentSettings, persistSettings,
-      loadAllSettingsFromGraph, ensureSettingsBlock,
-      persistSettingToGraph, ensureSettingsPage,
-    };
-  }
-  // === SETTINGS-PAGE LIB END v1.0.0 ===
-
-  const _settingsMgr = createSettingsManager({
-    SETTINGS_PAGE, GRAPH_SETTINGS,
-    settingsRef: state.settings,
-    log,
-    sk,
-  });
-  const {
-    loadPersistentSettings, persistSettings,
-    loadAllSettingsFromGraph, persistSettingToGraph, ensureSettingsPage,
-  } = _settingsMgr;
+  const debug = () => {};
 
   /* ---------- Roam helpers ---------- */
+  const CHILDREN_PULL = "[{:block/children [:block/uid :block/string :block/order]}]";
+
+  function childrenFromPull(data) {
+    return (data?.[":block/children"] || [])
+      .map(c => ({
+        uid: c[":block/uid"],
+        string: c[":block/string"] || "",
+        order: c[":block/order"] || 0,
+      }))
+      .sort((a, b) => a.order - b.order);
+  }
+
   function todayPageUid() {
     try { return window.roamAlphaAPI.util.dateToPageUid(new Date()); } catch { return null; }
   }
@@ -473,19 +92,25 @@ export function createLegacyRuntime({ extensionAPI }) {
   function getDirectChildren(parentUid) {
     try {
       const data = window.roamAlphaAPI.data.pull(
-        "[{:block/children [:block/uid :block/string :block/order]}]",
+        CHILDREN_PULL,
         [":block/uid", parentUid]
       );
-      const children = (data?.[":block/children"] || [])
-        .map(c => ({
-          uid: c[":block/uid"],
-          string: c[":block/string"] || "",
-          order: c[":block/order"] || 0,
-        }))
-        .sort((a, b) => a.order - b.order);
-      return children;
+      return childrenFromPull(data);
     } catch (e) {
       debug("getDirectChildren failed", { parentUid, err: e?.message || e });
+      return [];
+    }
+  }
+
+  async function getDirectChildrenAsync(parentUid) {
+    try {
+      const asyncPull = window.roamAlphaAPI.data.async?.pull;
+      const data = typeof asyncPull === "function"
+        ? await asyncPull(CHILDREN_PULL, [":block/uid", parentUid])
+        : window.roamAlphaAPI.data.pull(CHILDREN_PULL, [":block/uid", parentUid]);
+      return childrenFromPull(data);
+    } catch (e) {
+      debug("getDirectChildrenAsync failed", { parentUid, err: e?.message || e });
       return [];
     }
   }
@@ -499,11 +124,6 @@ export function createLegacyRuntime({ extensionAPI }) {
     return new RegExp("(?:^|\\s)" + escSig + "(?=\\s|$)");
   }
 
-  function isTimeBlockParent(blockString) {
-    const re = buildTimeBlockSignatureRegex();
-    return Boolean(re && re.test(blockString || ""));
-  }
-
   function findTimeBlockUid(dailyPageUid) {
     const re = buildTimeBlockSignatureRegex();
     if (!re) return null;
@@ -512,6 +132,12 @@ export function createLegacyRuntime({ extensionAPI }) {
       if (re.test(c.string)) return c.uid;
     }
     return null;
+  }
+
+  function findTimeBlockUidInChildren(children) {
+    const re = buildTimeBlockSignatureRegex();
+    if (!re) return null;
+    return children.find(child => re.test(child.string))?.uid || null;
   }
 
   /* ---------- parsing ---------- */
@@ -535,10 +161,8 @@ export function createLegacyRuntime({ extensionAPI }) {
   const TODO_TIME_PREFIX_RE = /^(\{\{\[\[(?:TODO|DONE)\]\]\}\}\s+)(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
   // v1.1.3 (C) Single-timestamp entries — SmartBlock elapsed-time logs
   // and similar point-in-time markers. Zero duration → sort-only support;
-  // detectOverlaps filters on endMin > startMin so they never conflict;
-  // rewriteTimePrefix tests RANGE patterns first and falls through, so
-  // single-stamp entries are never auto-bumped (the user's choice of when
-  // they clicked the timestamp is preserved).
+  // detectOverlaps filters on endMin > startMin so they never conflict.
+  // The organizer never rewrites user-entered timestamps.
   const SINGLE_TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s+(?=\S)/;
   const ACTIVE_TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})(?:\s*[-–])?\s+(?=\S)/;
 
@@ -620,16 +244,6 @@ export function createLegacyRuntime({ extensionAPI }) {
     return h * 60 + mn;
   }
 
-  /* Combined sort hint: strict parse takes priority (preserves existing
-   * end-time-based sort tie-breaking by returning the full {startMin,
-   * endMin} structure indirectly via parseTimePrefix), and loose parse
-   * fills in for everything else. Used by the bucketing logic below. */
-  function sortHint(s) {
-    const strict = parseTimePrefix(s);
-    if (strict) return strict.startMin;
-    return looseParseTimePrefix(s);
-  }
-
   function isSmartBlockButton(s) {
     return s === state.settings.smartblockButtonSignature;
   }
@@ -649,48 +263,13 @@ export function createLegacyRuntime({ extensionAPI }) {
     return activeSessionStart(s) !== null;
   }
 
-  function isPinned(s) {
-    const marker = state.settings.pinnedMarker;
-    return marker && s.includes(marker);
-  }
-
   function formatMinAsHHMM(minutes) {
     if (!Number.isFinite(minutes) || minutes < 0) return "00:00";
-    // v1.1.7 — 1440 is the canonical end-of-day that parseTimePrefix
-    // deliberately accepts as an END time (`23:00 - 24:00`). The `% 24` below
-    // mapped it to "00:00", so any rewrite round-tripped that range into
-    // `23:00 - 00:00`, which then reads and sorts as a backwards range.
-    // Only 1440 exactly is special: 1441+ stays wrapped as before.
+    // 1440 is the canonical end-of-day accepted by parseTimePrefix as an end.
     if (minutes === 1440) return "24:00";
     const h = Math.floor(minutes / 60) % 24;
     const m = minutes % 60;
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-  }
-
-  function parseCutoffTime(hhmm) {
-    if (!hhmm || typeof hhmm !== "string") return 23 * 60;
-    const m = hhmm.trim().match(/^(\d{1,2}):(\d{2})$/);
-    if (!m) return 23 * 60;
-    const h = parseInt(m[1], 10), mm = parseInt(m[2], 10);
-    if (h > 23 || mm > 59) return 23 * 60;
-    return h * 60 + mm;
-  }
-
-  /* Replace the leading time range with new times — preserves whichever shape
-   * the block uses (canonical-first or tool-prefixed). Everything after the
-   * time range survives verbatim (TODO marker, block ref, markdown link, tags,
-   * anything). Returns the original string unchanged if neither pattern fits. */
-  function rewriteTimePrefix(blockString, newStartMin, newEndMin) {
-    const sh = formatMinAsHHMM(newStartMin);
-    const eh = formatMinAsHHMM(newEndMin);
-    if (TIME_PREFIX_RE.test(blockString)) {
-      return blockString.replace(TIME_PREFIX_RE, `${sh} - ${eh} `);
-    }
-    if (TODO_TIME_PREFIX_RE.test(blockString)) {
-      // Preserve the marker prefix (capture group 1: `{{[[TODO]]}} ` or `{{[[DONE]]}} `)
-      return blockString.replace(TODO_TIME_PREFIX_RE, (_match, marker) => `${marker}${sh} - ${eh} `);
-    }
-    return blockString;
   }
 
   /* ---------- Phase 2: conflict detection ---------- */
@@ -700,19 +279,15 @@ export function createLegacyRuntime({ extensionAPI }) {
    * (no time to overlap) and malformed ones (end < start).
    */
   function conflictIgnoreTags() {
-    const ignoreList = String(state.settings.conflictIgnoreMarkers || "")
+    return Array.from(new Set(String(state.settings.conflictIgnoreMarkers || "")
       .split(",")
       .map(s => s.trim())
-      .filter(Boolean);
-    if (state.settings.concurrentMarker) ignoreList.push(state.settings.concurrentMarker);
-    return Array.from(new Set(ignoreList));
+      .filter(Boolean)));
   }
 
   function detectOverlaps(sortedItems) {
     const conflicts = [];
-    // v1.1.6: merge the single `concurrentMarker` with the multi-tag
-    // `conflictIgnoreMarkers` list into one set of substrings. EITHER block
-    // in an overlapping pair carrying ANY of these tags skips the conflict.
+    // Any configured marker on either block makes the overlap intentional.
     const ignoreSet = conflictIgnoreTags();
     const hasIgnoreTag = str => ignoreSet.some(tag => str.includes(tag));
     const parsed = sortedItems
@@ -749,145 +324,104 @@ export function createLegacyRuntime({ extensionAPI }) {
     return `${formatMinAsHHMM(t.startMin)}-${formatMinAsHHMM(t.endMin)}`;
   }
 
-  /* ---------- Phase 3: bump_forward auto-resolve ---------- */
-  /**
-   * Walk sorted items left-to-right. For each pair where curr.startMin <
-   * prev.endMin AND curr is not pinned, rewrite curr's start to prev.endMin
-   * (preserving duration). If the new end exceeds cutoff, abort and report
-   * the dead-end. Returns { ok, updates, deadEnds }.
-   *
-   * Note: this is destructive on the input array's `t` field (mutates the
-   * working copy). Callers should map item.string updates from `updates`.
-   */
-  function resolveConflicts(items, cutoffMin) {
-    const working = items
-      .map(it => ({
-        uid: it.uid,
-        originalString: it.string,
-        currentString: it.string,
-        t: parseTimePrefix(it.string),
-        pinned: isPinned(it.string),
-      }))
-      .filter(it => it.t && !isActiveSession(it.originalString));
-    const updates = [];
-    const deadEnds = [];
-
-    for (let i = 1; i < working.length; i++) {
-      const prev = working[i - 1];
-      const curr = working[i];
-      if (curr.t.startMin >= prev.t.endMin) continue; // no overlap
-      if (curr.pinned) {
-        deadEnds.push({
-          item: curr,
-          reason: `pinned (${state.settings.pinnedMarker}) — refusing to bump`,
-        });
-        continue;
-      }
-      const duration = curr.t.endMin - curr.t.startMin;
-      const newStart = prev.t.endMin;
-      const newEnd = newStart + duration;
-      if (newEnd > cutoffMin) {
-        deadEnds.push({
-          item: curr,
-          reason: `cascade past cutoff: would end ${formatMinAsHHMM(newEnd)} > ${formatMinAsHHMM(cutoffMin)}`,
-        });
-        continue;
-      }
-      curr.t = { startMin: newStart, endMin: newEnd };
-      curr.currentString = rewriteTimePrefix(curr.currentString, newStart, newEnd);
-      updates.push({
-        uid: curr.uid,
-        oldString: curr.originalString,
-        newString: curr.currentString,
-        bumpedFrom: parseTimePrefix(curr.originalString),
-        bumpedTo: { startMin: newStart, endMin: newEnd },
-      });
-    }
-    return { updates, deadEnds };
-  }
-
   /* ---------- status block management (Phase 2) ---------- */
   const STATUS_BLOCK_PREFIX = "**TimeBlock Conflicts**";
 
-  function findStatusBlockUid(pageUid) {
-    const children = getDirectChildren(pageUid);
-    for (const c of children) {
-      if (c.string.startsWith(STATUS_BLOCK_PREFIX)) return c.uid;
-    }
-    return null;
+  function statusBlocksIn(children) {
+    return children.filter(child => child.string.startsWith(STATUS_BLOCK_PREFIX));
   }
 
-  async function deleteStatusBlock(pageUid) {
-    const uid = findStatusBlockUid(pageUid);
-    if (!uid) return false;
-    try {
-      await window.roamAlphaAPI.data.block.delete({ block: { uid } });
-      return true;
-    } catch (e) {
-      log("warn", `delete status block ${uid} failed`, e?.message || e);
-      return false;
-    }
+  function conflictStatusLine(conflict) {
+    return `((${conflict.a.uid})) overlaps ((${conflict.b.uid})) — ${conflict.overlapMinutes}min`;
   }
 
-  async function ensureStatusBlock(pageUid, conflicts, deadEnds) {
-    if (!state.settings.conflictStatusBlock) return;
-    const total = conflicts.length + deadEnds.length;
-    if (total === 0) {
-      await deleteStatusBlock(pageUid);
-      return;
+  function conflictReportLine(conflict) {
+    const a = `${timeRangeOf(conflict.a)} "${shortDescription(conflict.a.string)}"`;
+    const b = `${timeRangeOf(conflict.b)} "${shortDescription(conflict.b.string)}"`;
+    return `${a} overlaps ${b} — ${conflict.overlapMinutes}min`;
+  }
+
+  async function syncConflictStatus(pageUid, conflicts, pageChildren) {
+    if (state.disposed || !state.settings.enabled) return { writes: 0 };
+    const api = window.roamAlphaAPI.data.block;
+    const statuses = statusBlocksIn(pageChildren);
+    let writes = 0;
+
+    // Turning output off also cleans duplicate/stale generated status blocks on
+    // pages the organizer actually visits. Historical graph data is not scanned.
+    if (!state.settings.persistentConflictOutput || conflicts.length === 0) {
+      for (const status of statuses) {
+        if (state.disposed || !state.settings.enabled) break;
+        try {
+          setPageSuppression(pageUid);
+          await api.delete({ block: { uid: status.uid } });
+          writes++;
+        } catch (e) { log("warn", `delete status block ${status.uid} failed`, e?.message || e); }
+      }
+      return { writes };
     }
-    const headerString = `${STATUS_BLOCK_PREFIX} (${total}) #timeblock-status`;
-    let statusUid = findStatusBlockUid(pageUid);
-    if (!statusUid) {
-      statusUid = window.roamAlphaAPI.util.generateUID();
+
+    const header = `${STATUS_BLOCK_PREFIX} (${conflicts.length}) #timeblock-status`;
+    const lines = conflicts.map(conflictStatusLine);
+    let canonical = statuses[0] || null;
+
+    for (const extra of statuses.slice(1)) {
+      if (state.disposed || !state.settings.enabled) break;
       try {
-        await window.roamAlphaAPI.data.block.create({
+        setPageSuppression(pageUid);
+        await api.delete({ block: { uid: extra.uid } });
+        writes++;
+      } catch (e) { log("warn", `delete duplicate status ${extra.uid} failed`, e?.message || e); }
+    }
+
+    if (!canonical) {
+      canonical = { uid: window.roamAlphaAPI.util.generateUID(), string: "" };
+      try {
+        setPageSuppression(pageUid);
+        await api.create({
           location: { "parent-uid": pageUid, order: "last" },
-          block: { uid: statusUid, string: headerString, open: false },
+          block: { uid: canonical.uid, string: header, open: false },
         });
+        canonical.string = header;
+        writes++;
       } catch (e) {
-        log("warn", `create status block failed`, e?.message || e);
-        return;
+        log("warn", "create status block failed", e?.message || e);
+        return { writes };
       }
-    } else {
+    } else if (canonical.string !== header) {
       try {
-        await window.roamAlphaAPI.data.block.update({
-          block: { uid: statusUid, string: headerString },
-        });
-      } catch (e) {
-        log("warn", `update status block string failed`, e?.message || e);
-      }
+        setPageSuppression(pageUid);
+        await api.update({ block: { uid: canonical.uid, string: header } });
+        writes++;
+      } catch (e) { log("warn", "update status header failed", e?.message || e); }
     }
-    // Wipe existing children and rewrite
-    const existing = getDirectChildren(statusUid);
-    for (const c of existing) {
-      try { await window.roamAlphaAPI.data.block.delete({ block: { uid: c.uid } }); }
-      catch {}
-    }
-    let order = 0;
-    for (const conf of conflicts) {
-      const aDesc = `${timeRangeOf(conf.a)} "${shortDescription(conf.a.string)}"`;
-      const bDesc = `${timeRangeOf(conf.b)} "${shortDescription(conf.b.string)}"`;
-      const line = `${aDesc} overlaps ${bDesc} — ${conf.overlapMinutes}min`;
+
+    const existing = await getDirectChildrenAsync(canonical.uid);
+    if (state.disposed || !state.settings.enabled) return { writes };
+    const sameLines = existing.length === lines.length &&
+      existing.every((child, index) => child.string === lines[index]);
+    if (sameLines) return { writes };
+
+    for (const child of existing) {
+      if (state.disposed || !state.settings.enabled) break;
       try {
-        await window.roamAlphaAPI.data.block.create({
-          location: { "parent-uid": statusUid, order },
-          block: { string: line },
-        });
-        order++;
-      } catch (e) { log("debug", `conflict line create failed`, e?.message || e); }
+        setPageSuppression(pageUid);
+        await api.delete({ block: { uid: child.uid } });
+        writes++;
+      } catch (e) { log("warn", `delete conflict line ${child.uid} failed`, e?.message || e); }
     }
-    for (const de of deadEnds) {
-      const desc = `${timeRangeOf(de.item)} "${shortDescription(de.item.originalString)}"`;
-      const line = `Dead-end: ${desc} — ${de.reason}`;
+    for (let order = 0; order < lines.length; order++) {
+      if (state.disposed || !state.settings.enabled) break;
       try {
-        await window.roamAlphaAPI.data.block.create({
-          location: { "parent-uid": statusUid, order },
-          block: { string: line },
+        setPageSuppression(pageUid);
+        await api.create({
+          location: { "parent-uid": canonical.uid, order },
+          block: { string: lines[order] },
         });
-        order++;
-      } catch (e) { log("debug", `dead-end line create failed`, e?.message || e); }
+        writes++;
+      } catch (e) { log("warn", "create conflict line failed", e?.message || e); }
     }
+    return { writes };
   }
 
   /* ---------- the core: reconcile ---------- */
@@ -901,10 +435,7 @@ export function createLegacyRuntime({ extensionAPI }) {
    * Items at the daily-page level that ARE time-prefixed get pulled into
    * TimeBlock at the right position.
    */
-  function computeDesiredOrder(pageUid, tbUid) {
-    const pageChildren = getDirectChildren(pageUid);
-    const tbChildren = getDirectChildren(tbUid);
-
+  function computeDesiredOrderFromChildren(pageChildren, tbChildren, tbUid) {
     const pageLevelMisplaced = pageChildren.filter(c =>
       c.uid !== tbUid && (isTimePrefixed(c.string) || isActiveSession(c.string))
     );
@@ -965,6 +496,14 @@ export function createLegacyRuntime({ extensionAPI }) {
     };
   }
 
+  function computeDesiredOrder(pageUid, tbUid) {
+    return computeDesiredOrderFromChildren(
+      getDirectChildren(pageUid),
+      getDirectChildren(tbUid),
+      tbUid,
+    );
+  }
+
   function isAlreadyOrganized(desired, currentTbChildren, pageLevelMisplaced) {
     if (pageLevelMisplaced.length > 0) return false;
     if (currentTbChildren.length !== desired.length) return false;
@@ -975,7 +514,7 @@ export function createLegacyRuntime({ extensionAPI }) {
   }
 
   function setPageSuppression(pageUid) {
-    state.suppressUntilByPage.set(pageUid, Date.now() + state.settings.suppressMs);
+    state.suppressUntilByPage.set(pageUid, Date.now() + RUNTIME.suppressMs);
   }
 
   function isPageSuppressed(pageUid) {
@@ -1012,10 +551,9 @@ export function createLegacyRuntime({ extensionAPI }) {
       desired.findIndex(item => item.uid === focusedUid);
   }
 
-  async function applyDesiredOrder(pageUid, tbUid, desired, pageLevelMisplaced, currentTbChildren) {
+  async function applyDesiredOrder(pageUid, tbUid, desired, pageLevelMisplaced) {
     const api = window.roamAlphaAPI.data.block;
     const desiredUids = desired.map(item => item.uid);
-    const workingUids = currentTbChildren.map(item => item.uid);
     let writes = 0;
 
     // Cross-parent entrants must be moved under TimeBlock before Roam's atomic
@@ -1027,7 +565,6 @@ export function createLegacyRuntime({ extensionAPI }) {
           location: { "parent-uid": tbUid, order: "last" },
           block: { uid: item.uid },
         });
-        workingUids.push(item.uid);
         writes++;
       } catch (e) {
         log("warn", `move into TimeBlock failed for ${item.uid}`, e?.message || e);
@@ -1035,11 +572,25 @@ export function createLegacyRuntime({ extensionAPI }) {
       }
     }
 
+    if (state.disposed || !state.settings.enabled) return { writes, failed: 0 };
+    const freshChildren = await getDirectChildrenAsync(tbUid);
+    const workingUids = freshChildren.map(item => item.uid);
     if (workingUids.length === desiredUids.length &&
         workingUids.every((uid, index) => uid === desiredUids[index])) {
       return { writes, failed: 0 };
     }
 
+    const currentSet = new Set(workingUids);
+    const exactSet = workingUids.length === desiredUids.length &&
+      desiredUids.every(uid => currentSet.has(uid));
+    if (!exactSet) {
+      // A SmartBlock changed siblings while we were awaiting writes. Never send
+      // a stale/partial list to reorderBlocks; coalesce a fresh pass instead.
+      scheduleReconcile(pageUid, "stale-reorder", RUNTIME.timeblockDebounceMs);
+      return { writes, failed: 0 };
+    }
+
+    let fallbackUids = workingUids;
     if (typeof api.reorderBlocks === "function") {
       try {
         setPageSuppression(pageUid);
@@ -1050,11 +601,19 @@ export function createLegacyRuntime({ extensionAPI }) {
         return { writes: writes + 1, failed: 0 };
       } catch (e) {
         log("warn", `atomic reorder failed on ${tbUid}; using minimal-move fallback`, e?.message || e);
+        fallbackUids = (await getDirectChildrenAsync(tbUid)).map(item => item.uid);
+        const fallbackSet = new Set(fallbackUids);
+        const stillExact = fallbackUids.length === desiredUids.length &&
+          desiredUids.every(uid => fallbackSet.has(uid));
+        if (!stillExact || state.disposed || !state.settings.enabled) {
+          scheduleReconcile(pageUid, "stale-reorder-fallback", RUNTIME.timeblockDebounceMs);
+          return { writes, failed: 0 };
+        }
       }
     }
 
     let failed = 0;
-    const movePlan = buildMinimalMovePlan(workingUids, desiredUids);
+    const movePlan = buildMinimalMovePlan(fallbackUids, desiredUids);
     for (const move of movePlan) {
       try {
         setPageSuppression(pageUid);
@@ -1073,28 +632,28 @@ export function createLegacyRuntime({ extensionAPI }) {
 
   async function reconcileTimeBlock(pageUid, reason = "watch") {
     if (state.disposed || !state.settings.enabled) return;
-    const tbUid = findTimeBlockUid(pageUid);
+    const pageChildren = await getDirectChildrenAsync(pageUid);
+    if (state.disposed || !state.settings.enabled) return;
+    const tbUid = findTimeBlockUidInChildren(pageChildren);
     if (!tbUid) {
+      await syncConflictStatus(pageUid, [], pageChildren);
       debug(`no TimeBlock parent on page ${pageUid} — skip`);
       return;
     }
-    const { desired, pageLevelMisplaced, currentTbChildren } = computeDesiredOrder(pageUid, tbUid);
+    const tbChildren = await getDirectChildrenAsync(tbUid);
+    if (state.disposed || !state.settings.enabled) return;
+    const { desired, pageLevelMisplaced, currentTbChildren } =
+      computeDesiredOrderFromChildren(pageChildren, tbChildren, tbUid);
 
     const alreadyOrganized = isAlreadyOrganized(desired, currentTbChildren, pageLevelMisplaced);
 
     if (!alreadyOrganized) {
       log("info", `reconciling TimeBlock on ${pageUid} (${reason}): ${pageLevelMisplaced.length} pulled in + reorder`);
-
-      if (state.settings.dryRun) {
-        log("info", `[dry-run] would move into order:`, desired.map(d => ({
-          uid: d.uid,
-          preview: d.string.slice(0, 50),
-        })));
-      } else if (focusedActiveSessionWouldMove(desired, currentTbChildren, pageLevelMisplaced)) {
-        debug(`focused active session on ${pageUid} would move — defer until its next change or sweep`);
+      if (focusedActiveSessionWouldMove(desired, currentTbChildren, pageLevelMisplaced)) {
+        debug(`focused active session on ${pageUid} would move — defer until its next change`);
       } else {
         const { writes, failed } = await applyDesiredOrder(
-          pageUid, tbUid, desired, pageLevelMisplaced, currentTbChildren
+          pageUid, tbUid, desired, pageLevelMisplaced
         );
         debug(`reconcile order complete: ${writes} write(s), ${failed} failure(s)`);
       }
@@ -1102,74 +661,25 @@ export function createLegacyRuntime({ extensionAPI }) {
       debug(`page ${pageUid} already organized (${desired.length} children)`);
     }
 
-    // ── Phase 3: auto-resolve conflicts (opt-in) ───────────────────────
-    let resolvedUpdates = [];
-    if (state.settings.conflictDetection && state.settings.autoResolveConflicts && !state.settings.dryRun) {
-      const finalChildren = getDirectChildren(tbUid);
-      const todos = finalChildren.filter(c => isTimePrefixed(c.string) && !isActiveSession(c.string));
-      const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
-      const result = resolveConflicts(todos, cutoff);
-      if (result.updates.length > 0) {
-        const api = window.roamAlphaAPI.data.block;
-        for (const u of result.updates) {
-          try {
-            setPageSuppression(pageUid);
-            await api.update({ block: { uid: u.uid, string: u.newString } });
-            resolvedUpdates.push(u);
-            log("info", `bumped ((${u.uid})): ${formatMinAsHHMM(u.bumpedFrom.startMin)} → ${formatMinAsHHMM(u.bumpedTo.startMin)}`);
-          } catch (e) {
-            log("warn", `bump failed for ${u.uid}`, e?.message || e);
-          }
-        }
-        if (resolvedUpdates.length > 0) {
-          const refreshed = computeDesiredOrder(pageUid, tbUid);
-          if (!isAlreadyOrganized(
-            refreshed.desired, refreshed.currentTbChildren, refreshed.pageLevelMisplaced
-          )) {
-            await applyDesiredOrder(
-              pageUid, tbUid, refreshed.desired,
-              refreshed.pageLevelMisplaced, refreshed.currentTbChildren
-            );
-          }
-        }
-      }
-    }
+    if (state.disposed || !state.settings.enabled) return;
 
-    // ── Phase 2: conflict detection + status block ─────────────────────
-    if (state.settings.conflictDetection) {
-      const finalChildren = getDirectChildren(tbUid);
-      const todos = finalChildren.filter(c => isTimePrefixed(c.string) && !isActiveSession(c.string));
-      const conflicts = detectOverlaps(todos);
-      // Re-detect dead-ends from any updates we attempted (resolveConflicts
-      // returned them above — they apply even after partial bumps).
-      let deadEnds = [];
-      if (state.settings.autoResolveConflicts) {
-        const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
-        const result = resolveConflicts(todos, cutoff); // re-run to detect any remaining
-        deadEnds = result.deadEnds;
-      }
-      if (conflicts.length > 0 || deadEnds.length > 0) {
-        log("warn", `${conflicts.length} conflict(s)${deadEnds.length ? ` + ${deadEnds.length} dead-end(s)` : ""} on page ${pageUid}`);
-        for (const c of conflicts) {
-          log("warn", `  ${timeRangeOf(c.a)} "${shortDescription(c.a.string)}" overlaps ${timeRangeOf(c.b)} "${shortDescription(c.b.string)}" (${c.overlapMinutes}min)`);
-        }
-        for (const de of deadEnds) {
-          log("warn", `  dead-end: ${timeRangeOf(de.item)} "${shortDescription(de.item.originalString)}" — ${de.reason}`);
-        }
-        if (!state.settings.dryRun) {
-          setPageSuppression(pageUid);
-          await ensureStatusBlock(pageUid, conflicts, deadEnds);
-        }
-      } else {
-        if (!state.settings.dryRun) {
-          setPageSuppression(pageUid);
-          await deleteStatusBlock(pageUid);
-        }
+    const completedRanges = desired.filter(item =>
+      isTimePrefixed(item.string) && !isActiveSession(item.string)
+    );
+    const conflicts = state.settings.persistentConflictOutput
+      ? detectOverlaps(completedRanges)
+      : [];
+    if (conflicts.length > 0) {
+      log("warn", `${conflicts.length} conflict(s) on page ${pageUid}`);
+      for (const conflict of conflicts) {
+        log("warn", `  ${conflictReportLine(conflict)}`);
       }
     }
+    await syncConflictStatus(pageUid, conflicts, pageChildren);
   }
 
   async function runReconcile(pageUid, reason) {
+    if (state.disposed || !state.settings.enabled) return;
     if (state.inFlightReconciles.has(pageUid)) {
       state.dirtyReconciles.set(pageUid, reason);
       return state.inFlightReconciles.get(pageUid);
@@ -1180,7 +690,7 @@ export function createLegacyRuntime({ extensionAPI }) {
         state.dirtyReconciles.delete(pageUid);
         await reconcileTimeBlock(pageUid, nextReason);
         nextReason = state.dirtyReconciles.get(pageUid);
-      } while (nextReason && state.settings.enabled);
+      } while (nextReason && !state.disposed && state.settings.enabled);
     })().finally(() => {
       state.inFlightReconciles.delete(pageUid);
       state.dirtyReconciles.delete(pageUid);
@@ -1189,7 +699,8 @@ export function createLegacyRuntime({ extensionAPI }) {
     return task;
   }
 
-  function scheduleReconcile(pageUid, reason, delayMs = state.settings.debounceMs) {
+  function scheduleReconcile(pageUid, reason, delayMs = RUNTIME.pageDebounceMs) {
+    if (state.disposed || !state.settings.enabled) return;
     if (state.pendingReconciles.has(pageUid)) {
       clearTimeout(state.pendingReconciles.get(pageUid));
     }
@@ -1245,9 +756,9 @@ export function createLegacyRuntime({ extensionAPI }) {
   }
 
   function timeBlockWatchFingerprint(pull) {
-    const ignoreTags = conflictIgnoreTags();
+    const ignoreTags = state.settings.persistentConflictOutput ? conflictIgnoreTags() : [];
     return childrenFromWatchPull(pull)
-      .map(item => `${item.uid}:${item.order}:${watchSortKey(item)}:${isPinned(item.string) ? 1 : 0}:${ignoreTags.some(tag => item.string.includes(tag)) ? 1 : 0}`)
+      .map(item => `${item.uid}:${item.order}:${watchSortKey(item)}:${ignoreTags.some(tag => item.string.includes(tag)) ? 1 : 0}`)
       .join("|");
   }
 
@@ -1260,21 +771,33 @@ export function createLegacyRuntime({ extensionAPI }) {
   function addOwnedPullWatch(uid, callback, label) {
     const entity = pullWatchEntity(uid);
     const data = window.roamAlphaAPI.data;
+    let removed = false;
+    const guarded = (before, after) => {
+      if (!removed && !state.disposed) callback(before, after);
+    };
+    let ready;
     try {
-      Promise.resolve(data.addPullWatch(WATCH_PULL, entity, callback)).catch(e =>
+      ready = Promise.resolve(data.addPullWatch(WATCH_PULL, entity, guarded)).then(() => true).catch(e => {
         log("warn", `addPullWatch failed for ${label} ${uid}`, e?.message || e)
-      );
+        return false;
+      });
     } catch (e) {
       log("warn", `addPullWatch failed for ${label} ${uid}`, e?.message || e);
+      ready = Promise.resolve(false);
     }
     return () => {
-      try {
-        Promise.resolve(data.removePullWatch(WATCH_PULL, entity, callback)).catch(e =>
+      if (removed) return;
+      removed = true;
+      ready.then((registered) => {
+        if (!registered) return;
+        try {
+          return Promise.resolve(data.removePullWatch(WATCH_PULL, entity, guarded)).catch(e =>
+            debug(`removePullWatch failed for ${label} ${uid}`, e?.message || e)
+          );
+        } catch (e) {
           debug(`removePullWatch failed for ${label} ${uid}`, e?.message || e)
-        );
-      } catch (e) {
-        debug(`removePullWatch failed for ${label} ${uid}`, e?.message || e);
-      }
+        }
+      }).catch(() => {});
     };
   }
 
@@ -1294,7 +817,7 @@ export function createLegacyRuntime({ extensionAPI }) {
       }
       if (!hasRelevantWatchChange(before, after, "timeblock")) return;
       watch.lastUsed = Date.now();
-      scheduleReconcile(pageUid, "timeblock-watch", state.settings.timeblockDebounceMs);
+      scheduleReconcile(pageUid, "timeblock-watch", RUNTIME.timeblockDebounceMs);
     };
     watch.timeBlockCallback = callback;
     watch.timeBlockUnsub = addOwnedPullWatch(nextUid, callback, "TimeBlock");
@@ -1308,7 +831,7 @@ export function createLegacyRuntime({ extensionAPI }) {
       refreshTimeBlockWatch(pageUid);
       return;
     }
-    if (state.activeWatches.size >= state.settings.maxActiveWatches) {
+    if (state.activeWatches.size >= RUNTIME.maxWatchedPages) {
       // Evict LRU
       let oldestUid = null, oldestTs = Infinity;
       for (const [uid, w] of state.activeWatches) {
@@ -1335,13 +858,13 @@ export function createLegacyRuntime({ extensionAPI }) {
       if (!hasRelevantWatchChange(before, after, "page")) return;
       watch.lastUsed = Date.now();
       refreshTimeBlockWatch(pageUid);
-      scheduleReconcile(pageUid, "page-watch", state.settings.debounceMs);
+      scheduleReconcile(pageUid, "page-watch", RUNTIME.pageDebounceMs);
     };
     watch.pageCallback = pageCallback;
     watch.pageUnsub = addOwnedPullWatch(pageUid, pageCallback, "page");
     refreshTimeBlockWatch(pageUid);
     debug(`registered watch on ${pageUid} (${reason}) — ${state.activeWatches.size} active`);
-    scheduleReconcile(pageUid, `${reason}-initial`, state.settings.timeblockDebounceMs);
+    scheduleReconcile(pageUid, `${reason}-initial`, RUNTIME.timeblockDebounceMs);
   }
 
   function unregisterWatch(pageUid) {
@@ -1359,8 +882,9 @@ export function createLegacyRuntime({ extensionAPI }) {
     debug(`unregistered watch on ${pageUid}`);
   }
 
-  /* ---------- timers: rollover + sweep ---------- */
+  /* ---------- rollover + bounded recovery ---------- */
   function checkRollover() {
+    if (!state.monitoringActive || !state.settings.enabled) return;
     const newToday = todayPageUid();
     if (!newToday) return;
     if (newToday === state.cachedTodayUid) return;
@@ -1374,23 +898,45 @@ export function createLegacyRuntime({ extensionAPI }) {
     onPageNavigation().catch(e => debug("rollover navigation refresh failed", e?.message || e));
   }
 
-  async function periodicSweep() {
-    if (!state.settings.enabled) return;
-    debug(`periodic sweep over ${state.activeWatches.size} watched pages`);
-    for (const [pageUid] of state.activeWatches) {
-      try { await runReconcile(pageUid, "sweep"); }
-      catch (e) { debug(`sweep reconcile failed on ${pageUid}`, e?.message || e); }
-    }
+  async function recoverToday(reason = "recovery") {
+    if (state.disposed || !state.monitoringActive || !state.settings.enabled) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    checkRollover();
+    const pageUid = state.cachedTodayUid || todayPageUid();
+    if (!pageUid) return;
+    registerWatch(pageUid, reason);
+    await runReconcile(pageUid, reason);
+  }
+
+  function attachVisibilityListener() {
+    if (state.visibilityListenerAttached || typeof document === "undefined") return;
+    const handler = () => {
+      if (document.visibilityState !== "visible") return;
+      recoverToday("visibility-recovery").catch(e =>
+        log("warn", "visibility recovery failed", e?.message || e)
+      );
+    };
+    document.addEventListener("visibilitychange", handler);
+    state._visibilityHandler = handler;
+    state.visibilityListenerAttached = true;
+  }
+
+  function detachVisibilityListener() {
+    if (!state.visibilityListenerAttached) return;
+    try { document.removeEventListener("visibilitychange", state._visibilityHandler); } catch {}
+    state._visibilityHandler = null;
+    state.visibilityListenerAttached = false;
   }
 
   /* ---------- navigation listener ---------- */
   async function onPageNavigation() {
-    if (!state.settings.enabled) return;
+    if (state.disposed || !state.monitoringActive || !state.settings.enabled) return;
     let openUid;
     try { openUid = await window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid(); }
     catch { return; }
+    if (state.disposed || !state.monitoringActive || !state.settings.enabled) return;
     let offset = null;
-    const window_ = state.settings.historicalWindowDays;
+    const window_ = RUNTIME.historicalWindowDays;
     for (let i = -window_; i <= 1; i++) {
       if (openUid === offsetPageUid(i)) {
         offset = i;
@@ -1441,53 +987,32 @@ export function createLegacyRuntime({ extensionAPI }) {
       } catch (e) { log("warn", `add cmd failed: ${label}`, e); }
     };
 
-    const toggleSetting = (graphKey, settingsKey, descriptor) => async () => {
-      state.settings[settingsKey] = !state.settings[settingsKey];
-      persistSettings();
-      await persistSettingToGraph(graphKey);
-      log("info", `${descriptor}: ${state.settings[settingsKey] ? "ON" : "OFF"}`);
-    };
-
-    add("TimeBlock Organizer: open settings page (edit toggles inline)", async () => {
-      try { await ensureSettingsPage(true); log("info", "Settings page opened in right sidebar"); }
-      catch (e) { log("error", "ensureSettingsPage failed", e); }
-    });
-    add("TimeBlock Organizer: reload settings from graph", () => {
-      const u = loadAllSettingsFromGraph();
-      log("info", u > 0 ? `${u} setting(s) reloaded` : "no setting changes detected");
-    });
-    add("TimeBlock Organizer: toggle enabled (master switch)", toggleSetting("enabled", "enabled", "enabled"));
-    add("TimeBlock Organizer: toggle dry-run mode", toggleSetting("dry_run", "dryRun", "dryRun"));
-    add("TimeBlock Organizer: toggle verbose logging", toggleSetting("verbose", "verbose", "verbose"));
-    add("TimeBlock Organizer: toggle conflict detection (Phase 2)", toggleSetting("conflict_detection", "conflictDetection", "conflictDetection"));
-    add("TimeBlock Organizer: toggle conflict status block on daily page", toggleSetting("conflict_status_block", "conflictStatusBlock", "conflictStatusBlock"));
-    add("TimeBlock Organizer: toggle auto-resolve conflicts (Phase 3, opt-in)", toggleSetting("auto_resolve_conflicts", "autoResolveConflicts", "autoResolveConflicts"));
     add("TimeBlock Organizer: show conflicts on current page", async () => {
       let openUid;
       try { openUid = await window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid(); }
       catch {}
       if (!openUid) return log("warn", "no open page detected");
-      const tbUid = findTimeBlockUid(openUid);
+      const pageChildren = await getDirectChildrenAsync(openUid);
+      const tbUid = findTimeBlockUidInChildren(pageChildren);
       if (!tbUid) return log("info", `no TimeBlock parent on ${openUid}`);
-      const finalChildren = getDirectChildren(tbUid);
-      const todos = finalChildren.filter(c => isTimePrefixed(c.string) && !isActiveSession(c.string));
+      const finalChildren = await getDirectChildrenAsync(tbUid);
+      const todos = finalChildren
+        .filter(c => isTimePrefixed(c.string) && !isActiveSession(c.string))
+        .sort((a, b) => {
+          const at = parseTimePrefix(a.string);
+          const bt = parseTimePrefix(b.string);
+          return (at.startMin - bt.startMin) || (at.endMin - bt.endMin);
+        });
       const conflicts = detectOverlaps(todos);
-      const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
-      const { deadEnds } = resolveConflicts(todos, cutoff);
-      if (conflicts.length === 0 && deadEnds.length === 0) {
+      if (conflicts.length === 0) {
         log("info", "no conflicts on this page");
         try { alert("No conflicts on this page."); } catch {}
         return;
       }
       const lines = [
-        `${conflicts.length} conflict(s), ${deadEnds.length} dead-end(s):`,
+        `${conflicts.length} conflict(s):`,
         "",
-        ...conflicts.map(c =>
-          `• ${timeRangeOf(c.a)} "${shortDescription(c.a.string)}" overlaps ${timeRangeOf(c.b)} "${shortDescription(c.b.string)}" — ${c.overlapMinutes}min`
-        ),
-        ...deadEnds.map(de =>
-          `× dead-end: ${timeRangeOf(de.item)} "${shortDescription(de.item.originalString)}" — ${de.reason}`
-        ),
+        ...conflicts.map(conflict => `• ${conflictReportLine(conflict)}`),
       ];
       console.log(lines.join("\n"));
       try { alert(lines.join("\n")); } catch {}
@@ -1510,31 +1035,26 @@ export function createLegacyRuntime({ extensionAPI }) {
       const lines = [
         `timeblock-organizer v${VERSION}`,
         ``,
-        `── toggles ──`,
+        `── settings ──`,
         `  ${onOff(state.settings.enabled)} enabled (master switch)`,
-        `  ${onOff(state.settings.dryRun)} dry-run mode`,
-        `  ${onOff(state.settings.verbose)} verbose logging`,
-        `  ${onOff(state.settings.conflictDetection)} conflict detection (Phase 2)`,
-        `  ${onOff(state.settings.conflictStatusBlock)} status block on daily page`,
-        `  ${onOff(state.settings.autoResolveConflicts)} auto-resolve conflicts (Phase 3, opt-in)`,
+        `  ${onOff(state.settings.persistentConflictOutput)} persistent conflict output`,
         ``,
         `── runtime ──`,
-        `  Watched pages: ${state.activeWatches.size} / ${state.settings.maxActiveWatches}`,
+        `  Watched pages: ${state.activeWatches.size} / ${RUNTIME.maxWatchedPages}`,
         `  Owned pull watches: ${Array.from(state.activeWatches.values()).reduce((n, w) => n + 1 + (w.timeBlockUid ? 1 : 0), 0)}`,
         `  Pending reconciles: ${state.pendingReconciles.size}`,
         `  In-flight reconciles: ${state.inFlightReconciles.size}`,
         `  Today UID: ${state.cachedTodayUid || "(none)"}`,
         `  TimeBlock signature: ${state.settings.timeblockSignature.slice(0, 60)}...`,
         `  SmartBlock button: ${state.settings.smartblockButtonSignature}`,
-        `  Debounce: page ${state.settings.debounceMs}ms / TimeBlock ${state.settings.timeblockDebounceMs}ms / sweep ${state.settings.sweepIntervalMs / 60000}min`,
-        `  Conflict strategy: ${state.settings.conflictStrategy} / cutoff: ${state.settings.cascadeCutoffTime} / pinned marker: ${state.settings.pinnedMarker}`,
+        `  Recovery: today only every ${RUNTIME.recoveryIntervalMs / 60000}min while visible`,
         ``,
         `Watched pages:`,
         ...Array.from(state.activeWatches.entries()).map(([uid, w]) =>
           `  - ${uid} (last used ${Math.round((Date.now() - w.lastUsed) / 1000)}s ago)`
         ),
         ``,
-        `Edit any setting via cmd palette → "open settings page", or paste new toggles into [[${SETTINGS_PAGE}]].`,
+        `Settings are managed in Roam Depot → TimeBlock Organizer.`,
       ];
       console.log(lines.join("\n"));
       try { alert(lines.join("\n")); } catch {}
@@ -1550,6 +1070,40 @@ export function createLegacyRuntime({ extensionAPI }) {
   }
 
   /* ---------- init / cleanup ---------- */
+  function activateMonitoring() {
+    if (state.monitoringActive || state.disposed || !state.settings.enabled) return;
+    state.monitoringActive = true;
+    state.cachedTodayUid = todayPageUid();
+    if (state.cachedTodayUid) registerWatch(state.cachedTodayUid, "init-today");
+    const tomorrow = tomorrowPageUid();
+    if (tomorrow) registerWatch(tomorrow, "init-tomorrow");
+    attachNavigationListener();
+    attachVisibilityListener();
+    onPageNavigation().catch(e => debug("initial navigation refresh failed", e?.message || e));
+    state.rolloverTimer = setInterval(checkRollover, RUNTIME.rolloverCheckMs);
+    state.recoveryTimer = setInterval(() => {
+      recoverToday("hourly-recovery").catch(e =>
+        log("warn", "hourly recovery failed", e?.message || e)
+      );
+    }, RUNTIME.recoveryIntervalMs);
+  }
+
+  function deactivateMonitoring() {
+    state.monitoringActive = false;
+    if (state.rolloverTimer) clearInterval(state.rolloverTimer);
+    if (state.recoveryTimer) clearInterval(state.recoveryTimer);
+    state.rolloverTimer = null;
+    state.recoveryTimer = null;
+    for (const timer of state.pendingReconciles.values()) clearTimeout(timer);
+    state.pendingReconciles.clear();
+    for (const uid of [...state.activeWatches.keys()]) unregisterWatch(uid);
+    state.dirtyReconciles.clear();
+    state.suppressUntilByPage.clear();
+    state.navigationPageUid = null;
+    detachNavigationListener();
+    detachVisibilityListener();
+  }
+
   function init() {
     log("info", `v${VERSION} starting`);
     const priorCleanup = window[`${NAMESPACE}_cleanup`];
@@ -1557,23 +1111,10 @@ export function createLegacyRuntime({ extensionAPI }) {
       try { priorCleanup(); log("info", "cleaned up prior version"); }
       catch (e) { log("warn", "prior cleanup threw", e?.message || e); }
     }
-    loadPersistentSettings();
-    ensureSettingsPage(false)
-      .then(() => extensionAPI ? 0 : loadAllSettingsFromGraph())
-      .catch(e => log("warn", "settings page bootstrap failed", e?.message || e));
     registerCommands();
 
     if (state.settings.enabled) {
-      state.cachedTodayUid = todayPageUid();
-      if (state.cachedTodayUid) registerWatch(state.cachedTodayUid, "init-today");
-      const tomorrow = tomorrowPageUid();
-      if (tomorrow) registerWatch(tomorrow, "init-tomorrow");
-      attachNavigationListener();
-      onPageNavigation().catch(e => debug("initial navigation refresh failed", e?.message || e));
-      state.rolloverTimer = setInterval(checkRollover, state.settings.rolloverCheckMs);
-      state.sweepTimer = setInterval(() => {
-        periodicSweep().catch(e => log("warn", "sweep threw", e?.message || e));
-      }, state.settings.sweepIntervalMs);
+      activateMonitoring();
     } else {
       log("warn", "enabled=false — running in dormant mode (no watches, no reconciles)");
     }
@@ -1583,16 +1124,8 @@ export function createLegacyRuntime({ extensionAPI }) {
   }
 
   function cleanup() {
-    if (state.rolloverTimer) clearInterval(state.rolloverTimer);
-    if (state.sweepTimer) clearInterval(state.sweepTimer);
-    for (const t of state.pendingReconciles.values()) clearTimeout(t);
-    state.pendingReconciles.clear();
-    for (const uid of [...state.activeWatches.keys()]) unregisterWatch(uid);
+    deactivateMonitoring();
     state.inFlightReconciles.clear();
-    state.dirtyReconciles.clear();
-    state.suppressUntilByPage.clear();
-    state.navigationPageUid = null;
-    detachNavigationListener();
     if (state.registeredCommandLabels) {
       for (const label of state.registeredCommandLabels) {
         try { commandPaletteApi.removeCommand({ label }); } catch {}
@@ -1603,17 +1136,67 @@ export function createLegacyRuntime({ extensionAPI }) {
   }
   let started = false;
   function readLegacySettings() {
-    loadPersistentSettings();
-    loadAllSettingsFromGraph();
-    return { ...state.settings };
+    const found = {};
+    const retainedKeys = new Set([
+      "enabled", "timeblockSignature", "activeSessionSignature",
+      "smartblockButtonSignature", "looseSortFallback", "untimedAtBottom",
+    ]);
+    try {
+      const raw = localStorage.getItem(`${NAMESPACE}:settings`);
+      const stored = raw ? JSON.parse(raw) : null;
+      if (stored && typeof stored === "object") {
+        for (const key of retainedKeys) {
+          if (stored[key] !== undefined) found[key] = stored[key];
+        }
+      }
+    } catch (e) { log("warn", "legacy local settings read failed", e?.message || e); }
+    try {
+      const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?s :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/string ?s]]
+      `);
+      const graphValues = Object.fromEntries((rows || []).map(row => {
+        const match = String(row?.[0] || "").trim().match(/^([a-z_][a-z0-9_]*)::\s*(.*)$/i);
+        return match ? [match[1], match[2]] : ["", ""];
+      }));
+      const specs = [
+        ["enabled", "enabled", "bool"],
+        ["timeblock_signature", "timeblockSignature", "string"],
+        ["active_session_signature", "activeSessionSignature", "string"],
+        ["smartblock_button_signature", "smartblockButtonSignature", "string"],
+        ["loose_sort_fallback", "looseSortFallback", "bool"],
+        ["untimed_at_bottom", "untimedAtBottom", "bool"],
+      ];
+      for (const [graphKey, key, type] of specs) {
+        if (!(graphKey in graphValues)) continue;
+        const raw = graphValues[graphKey];
+        found[key] = type === "bool"
+          ? ["true", "yes", "on", "1", "y"].includes(String(raw).trim().toLowerCase())
+          : String(raw).trim();
+      }
+    } catch (e) { log("warn", "legacy graph settings read failed", e?.message || e); }
+    return found;
   }
   function applySettings(settings) {
-    Object.assign(state.settings, settings || {});
-    persistSettings();
+    for (const key of Object.keys(DEFAULTS)) {
+      if (settings?.[key] !== undefined) state.settings[key] = settings[key];
+    }
   }
   function setSetting(key, value) {
+    if (!(key in DEFAULTS)) return;
+    const wasEnabled = state.settings.enabled;
     state.settings[key] = value;
-    persistSettings();
+    if (!started) return;
+    if (key === "enabled" && Boolean(value) !== wasEnabled) {
+      if (value) activateMonitoring();
+      else deactivateMonitoring();
+      return;
+    }
+    if (key === "persistentConflictOutput") {
+      recoverToday("settings-change").catch(e =>
+        log("warn", "settings recovery failed", e?.message || e)
+      );
+    }
   }
   function start() {
     if (started) return;
@@ -1643,11 +1226,12 @@ export function createLegacyRuntime({ extensionAPI }) {
     setSetting,
     getSettings: () => ({ ...state.settings }),
     helpers: {
-      parseTimePrefix, looseParseTimePrefix, detectOverlaps, resolveConflicts,
+      parseTimePrefix, looseParseTimePrefix, detectOverlaps,
       formatMinAsHHMM, stripLeadingNoise, activeSessionStart, isActiveSession,
       buildTimeBlockSignatureRegex, buildMinimalMovePlan,
       computeDesiredOrder, reconcileTimeBlock, runReconcile, registerWatch,
-      unregisterWatch, onPageNavigation, pageWatchFingerprint,
+      unregisterWatch, onPageNavigation, recoverToday, syncConflictStatus,
+      pageWatchFingerprint,
       timeBlockWatchFingerprint,
       /* v1.1.7 — pure ordering kernel, extracted so the sort contract is
        * testable without a live graph. computeDesiredOrder does the same

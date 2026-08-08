@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.2.0] - 2026-08-08
+
+Safer active-session behavior with less background work and a smaller settings surface.
+
+- Removed automatic conflict resolution and every timestamp-rewrite path. Manual
+  conflict inspection remains available and never changes user blocks.
+- Made persistent conflict summaries opt-in. Status synchronization is deterministic,
+  skips identical output, removes duplicates, and cleans stale generated summaries on
+  pages the organizer visits when output is disabled.
+- Replaced the five-minute all-watched-page sweep with startup reconciliation,
+  visibility-resume recovery, and an hourly recovery for today only. Reconciliation
+  uses narrow asynchronous pulls, while the two shallow event watches remain primary.
+- Internalized debounce, watch-cap, suppression, rollover, and recovery controls.
+  Simplified intentional-overlap markers to `#calendar`, `#concurrent`, and
+  `#no-conflict`.
+- Consolidated persistence into individual Roam Depot setting keys. A guarded one-time
+  migration preserves compatible workflow signatures and ordering preferences, then
+  ignores the old snapshot, localStorage, and graph settings page. The Enabled switch
+  now starts and stops watches, timers, and listeners immediately.
+- Hardened pull-watch cleanup against unload-before-registration races and prevents
+  stale or partial child lists from reaching `block.reorderBlocks`.
+- Expanded the regression suite from 23 to 32 tests, covering no-rewrite guarantees,
+  opt-in/idempotent status output, migration precedence, read-only installs, async
+  pulls, live enable/disable, and visible today-only recovery.
+
 ## [1.1.8] - 2026-08-08
 
 Continuous organization without broad graph work.
